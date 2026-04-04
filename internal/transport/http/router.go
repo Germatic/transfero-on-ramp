@@ -28,7 +28,18 @@ func NewRouter(
 	// Public
 	mux.HandleFunc("GET /health", handleHealth)
 
-	// Protected
+	// Protected — settlement API (canonical names)
+	mux.Handle("GET /v1/rates", authMW(handleGetRates(svc, log)))
+	mux.Handle("POST /v1/settlements/quote", authMW(handleCreateQuote(svc, log)))
+	mux.Handle("POST /v1/settlements", authMW(handleConfirmOrder(svc, log)))
+	mux.Handle("GET /v1/settlements", authMW(handleListOrders(svc, log)))
+	mux.Handle("GET /v1/settlements/{id}", authMW(handleGetOrder(svc, log)))
+
+	// Internal execution endpoint — called exclusively by dinapay's OnRampExecutor.
+	// Auth is the same Bearer middleware; the internal key is registered in ONRAMP_API_KEYS.
+	mux.Handle("POST /v1/internal/execute", authMW(handleInternalExecute(svc, log)))
+
+	// Backward-compatible aliases (deprecated — will be removed in a future release)
 	mux.Handle("POST /v1/quotes", authMW(handleCreateQuote(svc, log)))
 	mux.Handle("POST /v1/orders", authMW(handleConfirmOrder(svc, log)))
 	mux.Handle("GET /v1/orders", authMW(handleListOrders(svc, log)))

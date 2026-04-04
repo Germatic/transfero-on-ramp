@@ -171,6 +171,85 @@ func handleListOrders(svc *service.OnRampService, log *slog.Logger) http.Handler
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Rates handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /v1/rates?settlement=D0
+// Returns an indicative BRL→USDT price. No quote is locked.
+func handleGetRates(svc *service.OnRampService, log *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		settlement := r.URL.Query().Get("settlement")
+		if settlement == "" {
+			settlement = "D0"
+		}
+
+		resp, err := svc.GetIndicativeRates(r.Context(), settlement)
+		if err != nil {
+			code, msg := mapServiceErr(err)
+			log.Warn("get rates failed", "err", err)
+			writeError(w, code, msg)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal execute handler (called by dinapay OnRampExecutor)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /v1/internal/execute
+// Atomically executes a BRL→USDT settlement: quote + confirm in one call.
+// Only reachable with the ONRAMP_INTERNAL_KEY registered in ONRAMP_API_KEYS.
+func handleInternalExecute(svc *service.OnRampService, log *slog.Logger) http.HandlerFunc {
+	type request struct {
+		PayoutID   string  `json:"payoutId"`
+		AccountID  string  `json:"accountId"`
+		BRLAmount  float64 `json:"brlAmount"`
+		Address    string  `json:"destinationAddress"`
+		Network    string  `json:"network"`
+		Settlement string  `json:"settlement"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req request
+		if err := decode(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if req.BRLAmount <= 0 {
+			writeError(w, http.StatusBadRequest, "brlAmount must be positive")
+			return
+		}
+		if req.Address == "" {
+			writeError(w, http.StatusBadRequest, "destinationAddress is required")
+			return
+		}
+		if req.AccountID == "" {
+			writeError(w, http.StatusBadRequest, "accountId is required")
+			return
+		}
+
+		resp, err := svc.ExecuteSettlement(r.Context(), service.ExecuteRequest{
+			PayoutID:   req.PayoutID,
+			AccountID:  req.AccountID,
+			BRLAmount:  req.BRLAmount,
+			Address:    req.Address,
+			Network:    req.Network,
+			Settlement: req.Settlement,
+		})
+		if err != nil {
+			code, msg := mapServiceErr(err)
+			log.Warn("internal execute failed", "payoutId", req.PayoutID, "err", err)
+			writeError(w, code, msg)
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, resp)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Error mapping
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -328,6 +328,128 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 	}, nil
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal execution (called by dinapay OnRampExecutor)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ExecuteRequest is the input for ExecuteSettlement.
+type ExecuteRequest struct {
+	PayoutID   string  // dinapay payout ID (for logging / idempotency tracking)
+	AccountID  string
+	BRLAmount  float64
+	Address    string
+	Network    string
+	Settlement string
+}
+
+// ExecuteResponse is the output for ExecuteSettlement.
+type ExecuteResponse struct {
+	SettlementID       string  `json:"settlementId"`
+	ClosingID          string  `json:"closingId"`
+	USDTAmount         float64 `json:"usdtAmount"`
+	BRLAmount          float64 `json:"brlAmount"`
+	ExchangeRate       float64 `json:"exchangeRate"`
+	DestinationAddress string  `json:"destinationAddress"`
+	Network            string  `json:"network"`
+}
+
+// ExecuteSettlement atomically runs CreateQuote + ConfirmOrder.
+// Called by dinapay's OnRampExecutor from the inline execution path.
+// The payoutId is stored in logs for traceability.
+func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteRequest) (ExecuteResponse, error) {
+	if req.Settlement == "" {
+		req.Settlement = "D0"
+	}
+	if req.Network == "" {
+		req.Network = "mainnet"
+	}
+
+	s.log.Info("internal execute settlement",
+		"payoutId", req.PayoutID,
+		"accountId", req.AccountID,
+		"brlAmount", req.BRLAmount,
+	)
+
+	quote, err := s.CreateQuote(ctx, QuoteRequest{
+		AccountID:          req.AccountID,
+		BRLAmount:          req.BRLAmount,
+		DestinationAddress: req.Address,
+		Settlement:         req.Settlement,
+		Network:            req.Network,
+	})
+	if err != nil {
+		return ExecuteResponse{}, fmt.Errorf("create quote: %w", err)
+	}
+
+	order, err := s.ConfirmOrder(ctx, OrderRequest{
+		AccountID: req.AccountID,
+		QuoteID:   quote.QuoteID,
+	})
+	if err != nil {
+		return ExecuteResponse{}, fmt.Errorf("confirm order: %w", err)
+	}
+
+	return ExecuteResponse{
+		SettlementID:       order.OrderID,
+		ClosingID:          order.ClosingID,
+		USDTAmount:         order.USDTAmount,
+		BRLAmount:          order.BRLAmount,
+		ExchangeRate:       order.Price,
+		DestinationAddress: order.DestinationAddress,
+		Network:            order.Network,
+	}, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Indicative rates
+// ─────────────────────────────────────────────────────────────────────────────
+
+// RatesResponse is the response for GET /v1/rates.
+type RatesResponse struct {
+	FromCurrency string  `json:"fromCurrency"`
+	ToCurrency   string  `json:"toCurrency"`
+	Price        float64 `json:"price"`
+	Settlement   string  `json:"settlement"`
+	IndicativeAt string  `json:"indicativeAt"`
+}
+
+// GetIndicativeRates returns the current indicative BRL→USDT price without locking a session.
+func (s *OnRampService) GetIndicativeRates(ctx context.Context, settlement string) (RatesResponse, error) {
+	if settlement == "" {
+		settlement = "D0"
+	}
+
+	grid, err := s.transfero.GetPrices(ctx)
+	if err != nil {
+		return RatesResponse{}, s.wrapTransferoErr(err, "get prices")
+	}
+
+	usdtPrices, ok := grid.Prices["USDT"]
+	if !ok {
+		return RatesResponse{}, fmt.Errorf("USDT prices not available")
+	}
+
+	var entry transfero.PriceEntry
+	switch settlement {
+	case "D0":
+		entry = usdtPrices.D0
+	case "D1":
+		entry = usdtPrices.D1
+	case "D2":
+		entry = usdtPrices.D2
+	default:
+		return RatesResponse{}, fmt.Errorf("invalid settlement %q", settlement)
+	}
+
+	return RatesResponse{
+		FromCurrency: "BRL",
+		ToCurrency:   "USDT",
+		Price:        entry.Price,
+		Settlement:   settlement,
+		IndicativeAt: time.Now().UTC().Format(time.RFC3339),
+	}, nil
+}
+
 // findClosingByOID searches recent Transfero closings for one matching our oid.
 // Used as a verification step when CloseSession returns an error.
 func (s *OnRampService) findClosingByOID(ctx context.Context, oid string) (*transfero.Closing, error) {
