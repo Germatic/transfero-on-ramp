@@ -1,0 +1,48 @@
+package db
+
+const schemaSQL = `
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Locked Transfero quote sessions, kept until confirmed or expired.
+CREATE TABLE IF NOT EXISTS onramp_quotes (
+    id                   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id           TEXT        NOT NULL,            -- maps to dinacore merchantId
+    transfero_session_id TEXT        NOT NULL,
+    brl_amount           NUMERIC(20,6) NOT NULL,
+    usdt_amount          NUMERIC(20,6) NOT NULL,
+    price                NUMERIC(20,6) NOT NULL,          -- BRL per USDT
+    settlement           TEXT        NOT NULL,            -- D0 | D1 | D2
+    destination_address  TEXT        NOT NULL,            -- Tron address
+    network              TEXT        NOT NULL DEFAULT 'mainnet',
+    status               TEXT        NOT NULL DEFAULT 'open',  -- open | used | expired
+    expires_at           TIMESTAMPTZ NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS onramp_quotes_status_expires
+    ON onramp_quotes (status, expires_at);
+CREATE INDEX IF NOT EXISTS onramp_quotes_account_id
+    ON onramp_quotes (account_id);
+
+-- Confirmed on-ramp orders (one per closed Transfero session).
+CREATE TABLE IF NOT EXISTS onramp_orders (
+    id                   UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id           TEXT        NOT NULL,
+    quote_id             UUID        NOT NULL REFERENCES onramp_quotes(id),
+    transfero_closing_id TEXT        NOT NULL,
+    oid                  TEXT        NOT NULL UNIQUE,     -- idempotency key (= quote_id)
+    brl_amount           NUMERIC(20,6) NOT NULL,
+    usdt_amount          NUMERIC(20,6) NOT NULL,
+    price                NUMERIC(20,6) NOT NULL,
+    settlement           TEXT        NOT NULL,
+    destination_address  TEXT        NOT NULL,
+    network              TEXT        NOT NULL,
+    status               TEXT        NOT NULL DEFAULT 'confirmed',  -- confirmed | delivering | delivered | failed
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS onramp_orders_account_id ON onramp_orders (account_id);
+CREATE INDEX IF NOT EXISTS onramp_orders_quote_id   ON onramp_orders (quote_id);
+CREATE INDEX IF NOT EXISTS onramp_orders_status     ON onramp_orders (status);
+`
