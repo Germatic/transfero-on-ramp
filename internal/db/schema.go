@@ -37,10 +37,14 @@ CREATE TABLE IF NOT EXISTS onramp_orders (
     settlement           TEXT        NOT NULL,
     destination_address  TEXT        NOT NULL,
     network              TEXT        NOT NULL,
-    status               TEXT        NOT NULL DEFAULT 'confirmed',  -- confirmed | delivering | delivered | failed
+    status               TEXT        NOT NULL DEFAULT 'confirmed',  -- awaiting_settlement | confirmed | delivering | delivered | failed | payment_failed
+    pix_payment_group_id TEXT,       -- Transfero paymentGroupId for the BRL PIX sent to OTC desk
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- add pix_payment_group_id if table already exists (idempotent migration)
+ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS pix_payment_group_id TEXT;
 
 CREATE INDEX IF NOT EXISTS onramp_orders_account_id ON onramp_orders (account_id);
 CREATE INDEX IF NOT EXISTS onramp_orders_quote_id   ON onramp_orders (quote_id);

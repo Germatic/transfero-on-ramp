@@ -14,6 +14,18 @@ type Config struct {
 	TransferoURL    string
 	TransferoAPIKey string
 	APIKeys         []string // legacy static keys (fallback when dinapay DB unavailable)
+
+	// Transfero BaaS — used to send PIX to the OTC desk after a trade is booked
+	BaasURL          string // https://api-baasic.transfero.com
+	BaasTokenURL     string // Azure AD token endpoint
+	BaasClientID     string
+	BaasClientSecret string
+	BaasScope        string
+	BaasAccountID    string // source account (2133 — the collector)
+
+	// OTC desk PIX key to send BRL to after CloseSession
+	OTCPixKey string // e.g. 6899becc-e5f6-4b80-902f-3b3dee23e468
+	OTCTaxID  string // Transfero CNPJ (optional — leave empty to omit)
 }
 
 func Load() Config {
@@ -26,6 +38,16 @@ func Load() Config {
 		TransferoURL:    getEnv("TRANSFERO_API_URL", "https://staging.otc.transfero.com"),
 		TransferoAPIKey: getEnv("TRANSFERO_API_KEY", ""),
 		APIKeys:         splitKeys(getEnv("ONRAMP_API_KEYS", "")),
+
+		BaasURL:          getEnv("TRANSFERO_BAAS_URL", "https://api-baasic.transfero.com"),
+		BaasTokenURL:     getEnv("TRANSFERO_BAAS_TOKEN_URL", ""),
+		BaasClientID:     getEnv("TRANSFERO_BAAS_CLIENT_ID", ""),
+		BaasClientSecret: getEnv("TRANSFERO_BAAS_CLIENT_SECRET", ""),
+		BaasScope:        getEnv("TRANSFERO_BAAS_SCOPE", ""),
+		BaasAccountID:    getEnv("TRANSFERO_BAAS_ACCOUNT_ID", "2133"),
+
+		OTCPixKey: getEnv("TRANSFERO_OTC_PIX_KEY", "6899becc-e5f6-4b80-902f-3b3dee23e468"),
+		OTCTaxID:  getEnv("TRANSFERO_OTC_TAX_ID", ""),
 	}
 }
 

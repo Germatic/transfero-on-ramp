@@ -64,8 +64,24 @@ func run(log *slog.Logger) error {
 		log.Warn("DINAPAY_DB_URL not set; API key resolution via static list only")
 	}
 
-	// ─── Transfero client ────────────────────────────────────────────────────
+	// ─── Transfero OTC client ────────────────────────────────────────────────
 	tc := transfero.New(cfg.TransferoURL, cfg.TransferoAPIKey)
+
+	// ─── Transfero BaaS client (for PIX send to OTC desk) ───────────────────
+	var baasClient *transfero.BaasClient
+	if cfg.BaasClientID != "" && cfg.BaasTokenURL != "" {
+		baasClient = transfero.NewBaasClient(
+			cfg.BaasURL,
+			cfg.BaasTokenURL,
+			cfg.BaasClientID,
+			cfg.BaasClientSecret,
+			cfg.BaasScope,
+		)
+		log.Info("transfero BaaS client ready",
+			"account", cfg.BaasAccountID, "otcPixKey", cfg.OTCPixKey)
+	} else {
+		log.Warn("TRANSFERO_BAAS_CLIENT_ID or TRANSFERO_BAAS_TOKEN_URL not set; PIX send to OTC desk disabled")
+	}
 
 	// ─── DinaCore client ─────────────────────────────────────────────────────
 	var dc *dinacore.Client
@@ -93,6 +109,14 @@ func run(log *slog.Logger) error {
 
 	// ─── Service & router ─────────────────────────────────────────────────────
 	svc := service.NewOnRampService(tc, dc, quoteStore, orderStore, log)
+	if baasClient != nil {
+		svc = svc.WithOTCDesk(service.OTCDeskConfig{
+			BaasClient: baasClient,
+			AccountID:  cfg.BaasAccountID,
+			PIXKey:     cfg.OTCPixKey,
+			TaxID:      cfg.OTCTaxID,
+		})
+	}
 	router := httpTransport.NewRouter(svc, cfg.APIKeys, dinapayPool, log)
 
 	// ─── HTTP server ──────────────────────────────────────────────────────────

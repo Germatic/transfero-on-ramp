@@ -11,20 +11,21 @@ import (
 
 // Order mirrors a row in onramp_orders.
 type Order struct {
-	ID                 string
-	AccountID          string
-	QuoteID            string
-	TransferoClosingID string
-	OID                string // idempotency key
-	BRLAmount          float64
-	USDTAmount         float64
-	Price              float64
-	Settlement         string
-	DestinationAddress string
-	Network            string
-	Status             string // confirmed | delivering | delivered | failed
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID                  string
+	AccountID           string
+	QuoteID             string
+	TransferoClosingID  string
+	OID                 string // idempotency key
+	BRLAmount           float64
+	USDTAmount          float64
+	Price               float64
+	Settlement          string
+	DestinationAddress  string
+	Network             string
+	Status              string // awaiting_settlement | confirmed | delivering | delivered | failed | payment_failed
+	PixPaymentGroupID   string // Transfero paymentGroupId for the BRL PIX sent to OTC desk
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
 }
 
 // OrderStore handles persistence for confirmed on-ramp orders.
@@ -43,9 +44,18 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 		INSERT INTO onramp_orders
 			(account_id, quote_id, transfero_closing_id, oid,
 			 brl_amount, usdt_amount, price, settlement,
-			 destination_address, network)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			 destination_address, network, status, pix_payment_group_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id`
+
+	status := o.Status
+	if status == "" {
+		status = "awaiting_settlement"
+	}
+	var pixGroupID *string
+	if o.PixPaymentGroupID != "" {
+		pixGroupID = &o.PixPaymentGroupID
+	}
 
 	var id string
 	err := s.pool.QueryRow(ctx, sql,
@@ -59,6 +69,8 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 		o.Settlement,
 		o.DestinationAddress,
 		o.Network,
+		status,
+		pixGroupID,
 	).Scan(&id)
 	return id, err
 }
@@ -68,10 +80,12 @@ func (s *OrderStore) Get(ctx context.Context, id string) (Order, error) {
 	const sql = `
 		SELECT id, account_id, quote_id, transfero_closing_id, oid,
 		       brl_amount, usdt_amount, price, settlement,
-		       destination_address, network, status, created_at, updated_at
+		       destination_address, network, status, pix_payment_group_id,
+		       created_at, updated_at
 		FROM onramp_orders WHERE id = $1`
 
 	var o Order
+	var pixGroupID *string
 	err := s.pool.QueryRow(ctx, sql, id).Scan(
 		&o.ID,
 		&o.AccountID,
@@ -85,9 +99,13 @@ func (s *OrderStore) Get(ctx context.Context, id string) (Order, error) {
 		&o.DestinationAddress,
 		&o.Network,
 		&o.Status,
+		&pixGroupID,
 		&o.CreatedAt,
 		&o.UpdatedAt,
 	)
+	if pixGroupID != nil {
+		o.PixPaymentGroupID = *pixGroupID
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Order{}, ErrNotFound
 	}
@@ -120,7 +138,8 @@ func (s *OrderStore) List(ctx context.Context, page, pageSize int) ([]Order, int
 	const sql = `
 		SELECT id, account_id, quote_id, transfero_closing_id, oid,
 		       brl_amount, usdt_amount, price, settlement,
-		       destination_address, network, status, created_at, updated_at
+		       destination_address, network, status, pix_payment_group_id,
+		       created_at, updated_at
 		FROM onramp_orders
 		ORDER BY created_at DESC
 		LIMIT $1 OFFSET $2`
@@ -134,6 +153,7 @@ func (s *OrderStore) List(ctx context.Context, page, pageSize int) ([]Order, int
 	var orders []Order
 	for rows.Next() {
 		var o Order
+		var pixGroupID *string
 		if err := rows.Scan(
 			&o.ID,
 			&o.AccountID,
@@ -147,10 +167,14 @@ func (s *OrderStore) List(ctx context.Context, page, pageSize int) ([]Order, int
 			&o.DestinationAddress,
 			&o.Network,
 			&o.Status,
+			&pixGroupID,
 			&o.CreatedAt,
 			&o.UpdatedAt,
 		); err != nil {
 			return nil, 0, err
+		}
+		if pixGroupID != nil {
+			o.PixPaymentGroupID = *pixGroupID
 		}
 		orders = append(orders, o)
 	}

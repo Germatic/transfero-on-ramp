@@ -70,18 +70,19 @@ type OrderRequest struct {
 
 // OrderResponse is returned after a trade is confirmed.
 type OrderResponse struct {
-	OrderID            string  `json:"orderId"`
-	QuoteID            string  `json:"quoteId"`
-	ClosingID          string  `json:"closingId"`
-	OID                string  `json:"oid"`
-	USDTAmount         float64 `json:"usdtAmount"`
-	BRLAmount          float64 `json:"brlAmount"`
-	Price              float64 `json:"price"`
-	Settlement         string  `json:"settlement"`
-	DestinationAddress string  `json:"destinationAddress"`
-	Network            string  `json:"network"`
-	Status             string  `json:"status"`
-	CreatedAt          string  `json:"createdAt"`
+	OrderID             string  `json:"orderId"`
+	QuoteID             string  `json:"quoteId"`
+	ClosingID           string  `json:"closingId"`
+	OID                 string  `json:"oid"`
+	USDTAmount          float64 `json:"usdtAmount"`
+	BRLAmount           float64 `json:"brlAmount"`
+	Price               float64 `json:"price"`
+	Settlement          string  `json:"settlement"`
+	DestinationAddress  string  `json:"destinationAddress"`
+	Network             string  `json:"network"`
+	Status              string  `json:"status"`
+	PixPaymentGroupID   string  `json:"pixPaymentGroupId,omitempty"` // Transfero paymentGroupId for the BRL PIX
+	CreatedAt           string  `json:"createdAt"`
 }
 
 // OrderListResponse is the payload for the list endpoint.
@@ -102,12 +103,21 @@ type PaginationMeta struct {
 // OnRampService
 // ─────────────────────────────────────────────────────────────────────────────
 
+// OTCDeskConfig holds the parameters for sending BRL to the Transfero OTC desk.
+type OTCDeskConfig struct {
+	BaasClient    *transfero.BaasClient
+	AccountID     string // source account (collector, e.g. "2133")
+	PIXKey        string // OTC desk PIX key
+	TaxID         string // Transfero CNPJ (optional)
+}
+
 // OnRampService orchestrates quote creation and order confirmation.
 type OnRampService struct {
 	transfero  *transfero.Client
 	dinacore   *dinacore.Client
 	quoteStore *store.QuoteStore
 	orderStore *store.OrderStore
+	otcDesk    *OTCDeskConfig // if set, BRL is sent via PIX after CloseSession
 	log        *slog.Logger
 }
 
@@ -126,6 +136,13 @@ func NewOnRampService(
 		orderStore: os,
 		log:        log,
 	}
+}
+
+// WithOTCDesk attaches the BaaS client and OTC desk config so that ConfirmOrder
+// automatically sends the quoted BRL amount via PIX after booking the trade.
+func (s *OnRampService) WithOTCDesk(cfg OTCDeskConfig) *OnRampService {
+	s.otcDesk = &cfg
+	return s
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -231,11 +248,13 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 //
 //  1. Validate the quote is open and not expired.
 //  2. Debit BRL from dinacore (reserves the funds).
-//  3. Close the Transfero session (books the trade).
+//  3. Close the Transfero session (books the trade at the locked price).
 //     On failure: verify whether the trade actually occurred (GET /v1/closings).
 //     If not: refund BRL.  If yes: continue to step 4.
-//  4. Credit USDT to dinacore (best-effort; logged on failure).
-//  5. Persist the order record.
+//  4. Send BRL via PIX to the Transfero OTC desk PIX key (funds the trade).
+//     On failure: persist order with status "payment_failed" and return error.
+//  5. Credit USDT to dinacore (best-effort; logged on failure).
+//  6. Persist the order record with status "awaiting_settlement".
 func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (OrderResponse, error) {
 	// 1. Load and validate the quote
 	quote, err := s.quoteStore.Get(ctx, req.QuoteID)
@@ -282,10 +301,55 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		closing = confirmed
 	}
 
-	// 4. Credit USDT to dinacore (best-effort: the trade is done, USDT is owed)
+	// 4. Send BRL via PIX to the Transfero OTC desk — funds the booked trade.
+	var pixPaymentGroupID string
+	orderStatus := "awaiting_settlement"
+	if s.otcDesk != nil && s.otcDesk.BaasClient != nil {
+		payee := transfero.PIXPayee{
+			Amount:       closing.TotalBRL,
+			Currency:     "BRL",
+			Name:         "Transfero OTC Desk",
+			TaxIDCountry: "BRA",
+			TaxID:        s.otcDesk.TaxID,
+			PixKey:       s.otcDesk.PIXKey,
+			Description:  "OTC settlement " + closing.ClosingID,
+		}
+		pgID, pixErr := s.otcDesk.BaasClient.SendPIX(ctx, s.otcDesk.AccountID, payee)
+		if pixErr != nil {
+			s.log.Error("PIX send to OTC desk failed — trade is booked but funds not sent; MANUAL INTERVENTION REQUIRED",
+				"quoteId", req.QuoteID, "closingId", closing.ClosingID,
+				"brlAmount", closing.TotalBRL, "otcPixKey", s.otcDesk.PIXKey, "err", pixErr)
+			// Persist so operators can see it and retry
+			_ = s.quoteStore.MarkUsed(ctx, req.QuoteID)
+			orderID, _ := s.orderStore.Insert(ctx, store.Order{
+				AccountID:          req.AccountID,
+				QuoteID:            req.QuoteID,
+				TransferoClosingID: closing.ClosingID,
+				OID:                req.QuoteID,
+				BRLAmount:          closing.TotalBRL,
+				USDTAmount:         closing.Amount,
+				Price:              closing.Price,
+				Settlement:         closing.Settlement,
+				DestinationAddress: quote.DestinationAddress,
+				Network:            quote.Network,
+				Status:             "payment_failed",
+			})
+			_ = orderID
+			return OrderResponse{}, fmt.Errorf("send BRL to OTC desk: %w", pixErr)
+		}
+		pixPaymentGroupID = pgID
+		s.log.Info("BRL sent to Transfero OTC desk",
+			"quoteId", req.QuoteID, "closingId", closing.ClosingID,
+			"brlAmount", closing.TotalBRL, "paymentGroupId", pgID)
+	} else {
+		s.log.Warn("OTC desk not configured — skipping PIX send; trade is booked only",
+			"quoteId", req.QuoteID, "closingId", closing.ClosingID)
+		orderStatus = "confirmed"
+	}
+
+	// 5. Credit USDT to dinacore (best-effort: the trade is done, USDT is in flight)
 	if s.dinacore != nil && req.AccountID != "" {
 		if err := s.dinacore.CreditBalance(ctx, req.AccountID, "USDT", closing.Amount, closing.ClosingID); err != nil {
-			// Log but do not fail — the Transfero trade is confirmed and USDT is in flight
 			s.log.Error("dinacore USDT credit failed — MANUAL INTERVENTION REQUIRED",
 				"quoteId", req.QuoteID, "closingId", closing.ClosingID,
 				"account", req.AccountID, "usdtAmount", closing.Amount, "err", err)
@@ -295,7 +359,7 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 	// Mark the quote as consumed (best-effort)
 	_ = s.quoteStore.MarkUsed(ctx, req.QuoteID)
 
-	// 5. Persist the confirmed order
+	// 6. Persist the confirmed order
 	orderID, err := s.orderStore.Insert(ctx, store.Order{
 		AccountID:          req.AccountID,
 		QuoteID:            req.QuoteID,
@@ -307,24 +371,27 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		Settlement:         closing.Settlement,
 		DestinationAddress: quote.DestinationAddress,
 		Network:            quote.Network,
+		Status:             orderStatus,
+		PixPaymentGroupID:  pixPaymentGroupID,
 	})
 	if err != nil {
 		return OrderResponse{}, fmt.Errorf("persist order: %w", err)
 	}
 
 	return OrderResponse{
-		OrderID:            orderID,
-		QuoteID:            req.QuoteID,
-		ClosingID:          closing.ClosingID,
-		OID:                req.QuoteID,
-		USDTAmount:         closing.Amount,
-		BRLAmount:          closing.TotalBRL,
-		Price:              closing.Price,
-		Settlement:         closing.Settlement,
-		DestinationAddress: quote.DestinationAddress,
-		Network:            quote.Network,
-		Status:             "confirmed",
-		CreatedAt:          closing.CreatedAt,
+		OrderID:             orderID,
+		QuoteID:             req.QuoteID,
+		ClosingID:           closing.ClosingID,
+		OID:                 req.QuoteID,
+		USDTAmount:          closing.Amount,
+		BRLAmount:           closing.TotalBRL,
+		Price:               closing.Price,
+		Settlement:          closing.Settlement,
+		DestinationAddress:  quote.DestinationAddress,
+		Network:             quote.Network,
+		Status:              orderStatus,
+		PixPaymentGroupID:   pixPaymentGroupID,
+		CreatedAt:           closing.CreatedAt,
 	}, nil
 }
 
@@ -526,6 +593,7 @@ func orderToResponse(o store.Order) OrderResponse {
 		DestinationAddress: o.DestinationAddress,
 		Network:            o.Network,
 		Status:             o.Status,
+		PixPaymentGroupID:  o.PixPaymentGroupID,
 		CreatedAt:          o.CreatedAt.Format(time.RFC3339),
 	}
 }
