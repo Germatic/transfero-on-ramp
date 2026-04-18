@@ -43,29 +43,28 @@ var (
 
 // QuoteRequest is the validated input for CreateQuote.
 type QuoteRequest struct {
-	AccountID          string  // resolved from Bearer token, not supplied by caller
-	BRLAmount          float64 // e.g. 25000.00
-	DestinationAddress string  // Tron address for on-chain USDT delivery
-	Settlement         string  // D0 | D1 | D2 (default D0)
-	Network            string  // mainnet | shasta (default mainnet)
+	AccountID  string  // resolved from Bearer token, not supplied by caller
+	BRLAmount  float64 // e.g. 25000.00
+	Settlement string  // D0 | D1 | D2 (default D0)
+	Network    string  // mainnet | shasta (default mainnet)
 }
 
 // QuoteResponse is returned to the customer after a price is locked.
 type QuoteResponse struct {
-	QuoteID            string  `json:"quoteId"`
-	USDTAmount         float64 `json:"usdtAmount"`
-	BRLAmount          float64 `json:"brlAmount"`
-	Price              float64 `json:"price"`      // BRL per USDT
-	Settlement         string  `json:"settlement"`
-	DestinationAddress string  `json:"destinationAddress"`
-	Network            string  `json:"network"`
-	ExpiresAt          string  `json:"expiresAt"` // RFC3339
+	QuoteID    string  `json:"quoteId"`
+	USDTAmount float64 `json:"usdtAmount"`
+	BRLAmount  float64 `json:"brlAmount"`
+	Price      float64 `json:"price"`      // BRL per USDT
+	Settlement string  `json:"settlement"`
+	Network    string  `json:"network"`
+	ExpiresAt  string  `json:"expiresAt"` // RFC3339
 }
 
 // OrderRequest is the validated input for ConfirmOrder.
 type OrderRequest struct {
-	AccountID string // resolved from Bearer token
-	QuoteID   string
+	AccountID          string // resolved from Bearer token
+	QuoteID            string
+	DestinationAddress string // TRC20 wallet where Transfero delivers USDT
 }
 
 // OrderResponse is returned after a trade is confirmed.
@@ -202,8 +201,8 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		}
 	}
 
-	// Lock the price by creating a Transfero session
-	sess, err := s.transfero.CreateSession(ctx, usdtAmount, req.Settlement, req.DestinationAddress)
+	// Lock the price by creating a Transfero session (wallet provided at close time)
+	sess, err := s.transfero.CreateSession(ctx, usdtAmount, req.Settlement)
 	if err != nil {
 		return QuoteResponse{}, s.wrapTransferoErr(err, "create session")
 	}
@@ -220,7 +219,6 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		USDTAmount:         sess.Amount,
 		Price:              sess.Price,
 		Settlement:         sess.Settlement,
-		DestinationAddress: req.DestinationAddress,
 		Network:            req.Network,
 		ExpiresAt:          expiresAt,
 	})
@@ -229,14 +227,13 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 	}
 
 	return QuoteResponse{
-		QuoteID:            quoteID,
-		USDTAmount:         sess.Amount,
-		BRLAmount:          sess.TotalBRL,
-		Price:              sess.Price,
-		Settlement:         sess.Settlement,
-		DestinationAddress: req.DestinationAddress,
-		Network:            req.Network,
-		ExpiresAt:          expiresAt.Format(time.RFC3339),
+		QuoteID:    quoteID,
+		USDTAmount: sess.Amount,
+		BRLAmount:  sess.TotalBRL,
+		Price:      sess.Price,
+		Settlement: sess.Settlement,
+		Network:    req.Network,
+		ExpiresAt:  expiresAt.Format(time.RFC3339),
 	}, nil
 }
 
@@ -275,9 +272,10 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		}
 	}
 
-	// 3. Close the Transfero session — books the trade
+	// 3. Close the Transfero session — books the trade at the locked price.
+	//    wallet is sent here so Transfero knows where to deliver USDT after settlement.
 	//    quoteId is the oid, making this call idempotent.
-	closing, closeErr := s.transfero.CloseSession(ctx, quote.TransferoSessionID, req.QuoteID)
+	closing, closeErr := s.transfero.CloseSession(ctx, quote.TransferoSessionID, req.QuoteID, req.DestinationAddress)
 	if closeErr != nil {
 		s.log.Warn("transfero close session failed; verifying trade state",
 			"quoteId", req.QuoteID, "sessionId", quote.TransferoSessionID, "err", closeErr)
@@ -330,7 +328,7 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 				USDTAmount:         closing.Amount,
 				Price:              closing.Price,
 				Settlement:         closing.Settlement,
-				DestinationAddress: quote.DestinationAddress,
+				DestinationAddress: req.DestinationAddress,
 				Network:            quote.Network,
 				Status:             "payment_failed",
 			})
@@ -369,7 +367,7 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		USDTAmount:         closing.Amount,
 		Price:              closing.Price,
 		Settlement:         closing.Settlement,
-		DestinationAddress: quote.DestinationAddress,
+		DestinationAddress: req.DestinationAddress,
 		Network:            quote.Network,
 		Status:             orderStatus,
 		PixPaymentGroupID:  pixPaymentGroupID,
@@ -438,19 +436,19 @@ func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteReques
 	)
 
 	quote, err := s.CreateQuote(ctx, QuoteRequest{
-		AccountID:          req.AccountID,
-		BRLAmount:          req.BRLAmount,
-		DestinationAddress: req.Address,
-		Settlement:         req.Settlement,
-		Network:            req.Network,
+		AccountID:  req.AccountID,
+		BRLAmount:  req.BRLAmount,
+		Settlement: req.Settlement,
+		Network:    req.Network,
 	})
 	if err != nil {
 		return ExecuteResponse{}, fmt.Errorf("create quote: %w", err)
 	}
 
 	order, err := s.ConfirmOrder(ctx, OrderRequest{
-		AccountID: req.AccountID,
-		QuoteID:   quote.QuoteID,
+		AccountID:          req.AccountID,
+		QuoteID:            quote.QuoteID,
+		DestinationAddress: req.Address,
 	})
 	if err != nil {
 		return ExecuteResponse{}, fmt.Errorf("confirm order: %w", err)

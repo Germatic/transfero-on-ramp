@@ -43,13 +43,13 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /v1/quotes
-// Body: { "brlAmount": 25000.00, "destinationAddress": "T...", "settlement": "D0", "network": "mainnet" }
+// Body: { "brlAmount": 25000.00, "settlement": "D0", "network": "mainnet" }
+// Note: destinationAddress is provided at settlement/confirm time, not here.
 func handleCreateQuote(svc *service.OnRampService, log *slog.Logger) http.HandlerFunc {
 	type request struct {
-		BRLAmount          float64 `json:"brlAmount"`
-		DestinationAddress string  `json:"destinationAddress"`
-		Settlement         string  `json:"settlement"`
-		Network            string  `json:"network"`
+		BRLAmount  float64 `json:"brlAmount"`
+		Settlement string  `json:"settlement"`
+		Network    string  `json:"network"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		account, ok := auth.FromContext(r.Context())
@@ -67,17 +67,12 @@ func handleCreateQuote(svc *service.OnRampService, log *slog.Logger) http.Handle
 			writeError(w, http.StatusBadRequest, "brlAmount must be positive")
 			return
 		}
-		if req.DestinationAddress == "" {
-			writeError(w, http.StatusBadRequest, "destinationAddress is required")
-			return
-		}
 
 		resp, err := svc.CreateQuote(r.Context(), service.QuoteRequest{
-			AccountID:          account.ID,
-			BRLAmount:          req.BRLAmount,
-			DestinationAddress: req.DestinationAddress,
-			Settlement:         req.Settlement,
-			Network:            req.Network,
+			AccountID:  account.ID,
+			BRLAmount:  req.BRLAmount,
+			Settlement: req.Settlement,
+			Network:    req.Network,
 		})
 		if err != nil {
 			code, msg := mapServiceErr(err)
@@ -95,10 +90,11 @@ func handleCreateQuote(svc *service.OnRampService, log *slog.Logger) http.Handle
 // ─────────────────────────────────────────────────────────────────────────────
 
 // POST /v1/orders
-// Body: { "quoteId": "..." }
+// Body: { "quoteId": "...", "destinationAddress": "T..." }
 func handleConfirmOrder(svc *service.OnRampService, log *slog.Logger) http.HandlerFunc {
 	type request struct {
-		QuoteID string `json:"quoteId"`
+		QuoteID            string `json:"quoteId"`
+		DestinationAddress string `json:"destinationAddress"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		account, ok := auth.FromContext(r.Context())
@@ -116,10 +112,15 @@ func handleConfirmOrder(svc *service.OnRampService, log *slog.Logger) http.Handl
 			writeError(w, http.StatusBadRequest, "quoteId is required")
 			return
 		}
+		if req.DestinationAddress == "" {
+			writeError(w, http.StatusBadRequest, "destinationAddress is required")
+			return
+		}
 
 		resp, err := svc.ConfirmOrder(r.Context(), service.OrderRequest{
-			AccountID: account.ID,
-			QuoteID:   req.QuoteID,
+			AccountID:          account.ID,
+			QuoteID:            req.QuoteID,
+			DestinationAddress: req.DestinationAddress,
 		})
 		if err != nil {
 			code, msg := mapServiceErr(err)

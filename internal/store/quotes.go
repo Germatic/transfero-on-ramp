@@ -53,6 +53,11 @@ func (s *QuoteStore) Insert(ctx context.Context, q Quote) (string, error) {
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id`
 
+	var addr *string
+	if q.DestinationAddress != "" {
+		addr = &q.DestinationAddress
+	}
+
 	var id string
 	err := s.pool.QueryRow(ctx, sql,
 		q.AccountID,
@@ -61,7 +66,7 @@ func (s *QuoteStore) Insert(ctx context.Context, q Quote) (string, error) {
 		q.USDTAmount,
 		q.Price,
 		q.Settlement,
-		q.DestinationAddress,
+		addr,
 		q.Network,
 		q.ExpiresAt,
 	).Scan(&id)
@@ -76,6 +81,7 @@ func (s *QuoteStore) Get(ctx context.Context, id string) (Quote, error) {
 		FROM onramp_quotes WHERE id = $1`
 
 	var q Quote
+	var addr *string
 	err := s.pool.QueryRow(ctx, sql, id).Scan(
 		&q.ID,
 		&q.AccountID,
@@ -84,12 +90,15 @@ func (s *QuoteStore) Get(ctx context.Context, id string) (Quote, error) {
 		&q.USDTAmount,
 		&q.Price,
 		&q.Settlement,
-		&q.DestinationAddress,
+		&addr,
 		&q.Network,
 		&q.Status,
 		&q.ExpiresAt,
 		&q.CreatedAt,
 	)
+	if addr != nil {
+		q.DestinationAddress = *addr
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Quote{}, ErrNotFound
 	}

@@ -196,20 +196,17 @@ func (c *Client) GetPrices(ctx context.Context) (*PriceGrid, error) {
 
 // CreateSession locks a price quote for the given USDT amount and settlement window.
 // The session expires after the server-configured TTL (~7 seconds by default).
-//
-// destinationAddress is the Tron address where USDT will be delivered after
-// the trade is confirmed and settled by Transfero.
-func (c *Client) CreateSession(ctx context.Context, usdtAmount float64, settlement, destinationAddress string) (*Session, error) {
+// The destination wallet is provided at close time, not here.
+func (c *Client) CreateSession(ctx context.Context, usdtAmount float64, settlement string) (*Session, error) {
 	tok, err := c.bearerToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	body := map[string]any{
-		"currency":            "USDT",
-		"settlement":          settlement,
-		"amount":              usdtAmount,
-		"destination_address": destinationAddress, // Tron address for on-chain delivery
+		"currency":   "USDT",
+		"settlement": settlement,
+		"amount":     usdtAmount,
 	}
 
 	var sess Session
@@ -220,14 +217,15 @@ func (c *Client) CreateSession(ctx context.Context, usdtAmount float64, settleme
 }
 
 // CloseSession confirms the trade locked by the session.
-// oid is your idempotency key — reusing the same oid returns the existing closing.
-func (c *Client) CloseSession(ctx context.Context, sessionID, oid string) (*Closing, error) {
+// oid is the idempotency key — reusing the same oid returns the existing closing.
+// wallet is the TRC20 address where Transfero will deliver USDT after settlement.
+func (c *Client) CloseSession(ctx context.Context, sessionID, oid, wallet string) (*Closing, error) {
 	tok, err := c.bearerToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	body := map[string]string{"oid": oid}
+	body := map[string]string{"oid": oid, "wallet": wallet}
 	var closing Closing
 	path := "/v1/sessions/" + sessionID + "/close"
 	if err := c.do(ctx, "POST", path, &tok, body, &closing); err != nil {

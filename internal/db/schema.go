@@ -12,12 +12,15 @@ CREATE TABLE IF NOT EXISTS onramp_quotes (
     usdt_amount          NUMERIC(20,6) NOT NULL,
     price                NUMERIC(20,6) NOT NULL,          -- BRL per USDT
     settlement           TEXT        NOT NULL,            -- D0 | D1 | D2
-    destination_address  TEXT        NOT NULL,            -- Tron address
+    destination_address  TEXT,                            -- Tron address (provided at confirm time, stored here for reference)
     network              TEXT        NOT NULL DEFAULT 'mainnet',
     status               TEXT        NOT NULL DEFAULT 'open',  -- open | used | expired
     expires_at           TIMESTAMPTZ NOT NULL,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- make destination_address nullable for existing tables (idempotent)
+ALTER TABLE onramp_quotes ALTER COLUMN destination_address DROP NOT NULL;
 
 CREATE INDEX IF NOT EXISTS onramp_quotes_status_expires
     ON onramp_quotes (status, expires_at);
