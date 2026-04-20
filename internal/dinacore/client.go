@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -21,10 +22,11 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 // BalanceResponse is returned by GET /api/balance/merchant/:id.
+// Balance is json.Number because DinaCore serialises it as a JSON string.
 type BalanceResponse struct {
-	MerchantID string  `json:"merchantId"`
-	Currency   string  `json:"currency"`
-	Balance    float64 `json:"balance"`
+	MerchantID string      `json:"merchantId"`
+	Currency   string      `json:"currency"`
+	Balance    json.Number `json:"balance"`
 }
 
 // APIError represents a dinacore error response.
@@ -68,7 +70,11 @@ func (c *Client) GetBalance(ctx context.Context, accountID, currency string) (fl
 	if err := c.do(ctx, "GET", path, nil, &resp); err != nil {
 		return 0, fmt.Errorf("dinacore get balance (%s %s): %w", accountID, currency, err)
 	}
-	return resp.Balance, nil
+	bal, err := resp.Balance.Float64()
+	if err != nil {
+		return 0, fmt.Errorf("dinacore get balance (%s %s): parse balance %q: %w", accountID, currency, resp.Balance, err)
+	}
+	return bal, nil
 }
 
 // DebitBalance debits amount from the account's currency balance.
@@ -77,7 +83,7 @@ func (c *Client) DebitBalance(ctx context.Context, accountID, currency string, a
 	body := map[string]any{
 		"merchantId": accountID,
 		"currency":   currency,
-		"amount":     amount,
+		"amount":     strconv.FormatFloat(amount, 'f', -1, 64),
 		"refId":      refID,
 		"refType":    "onramp_debit",
 	}
@@ -93,7 +99,7 @@ func (c *Client) CreditBalance(ctx context.Context, accountID, currency string, 
 	body := map[string]any{
 		"merchantId": accountID,
 		"currency":   currency,
-		"amount":     amount,
+		"amount":     strconv.FormatFloat(amount, 'f', -1, 64),
 		"refId":      refID,
 		"refType":    "onramp_credit",
 	}
@@ -109,7 +115,7 @@ func (c *Client) RefundBRL(ctx context.Context, accountID string, amount float64
 	body := map[string]any{
 		"merchantId": accountID,
 		"currency":   "BRL",
-		"amount":     amount,
+		"amount":     strconv.FormatFloat(amount, 'f', -1, 64),
 		"refId":      originalRefID + "-refund",
 		"refType":    "onramp_refund",
 	}
