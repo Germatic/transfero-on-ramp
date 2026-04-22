@@ -49,7 +49,35 @@ CREATE TABLE IF NOT EXISTS onramp_orders (
 -- add pix_payment_group_id if table already exists (idempotent migration)
 ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS pix_payment_group_id TEXT;
 
+-- fee audit columns (idempotent)
+ALTER TABLE onramp_quotes ADD COLUMN IF NOT EXISTS fee_pct   NUMERIC(8,6) NOT NULL DEFAULT 0;
+ALTER TABLE onramp_quotes ADD COLUMN IF NOT EXISTS raw_price NUMERIC(20,6);
+
+ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS fee_pct   NUMERIC(8,6) NOT NULL DEFAULT 0;
+ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS raw_price NUMERIC(20,6);
+
 CREATE INDEX IF NOT EXISTS onramp_orders_account_id ON onramp_orders (account_id);
 CREATE INDEX IF NOT EXISTS onramp_orders_quote_id   ON onramp_orders (quote_id);
 CREATE INDEX IF NOT EXISTS onramp_orders_status     ON onramp_orders (status);
+
+-- -------------------------------------------------------
+-- Onramp fee schedule — per account + currency pair.
+-- fee_pct is a multiplier applied to Transfero's raw price
+-- at quote time: adjusted_price = raw_price * (1 + fee_pct).
+-- e.g. 0.002000 = 0.2% markup. 0 = passthrough (default).
+-- effective_from PK preserves full audit history; the latest
+-- row per (account_id, from_currency, to_currency) is active.
+-- No row = 0% fee.
+-- -------------------------------------------------------
+CREATE TABLE IF NOT EXISTS onramp_fees (
+  account_id     TEXT         NOT NULL,
+  from_currency  TEXT         NOT NULL,
+  to_currency    TEXT         NOT NULL,
+  fee_pct        NUMERIC(8,6) NOT NULL DEFAULT 0,
+  effective_from TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, from_currency, to_currency, effective_from)
+);
+
+CREATE INDEX IF NOT EXISTS onramp_fees_lookup
+  ON onramp_fees (account_id, from_currency, to_currency, effective_from DESC);
 `

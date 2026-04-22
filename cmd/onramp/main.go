@@ -95,6 +95,7 @@ func run(log *slog.Logger) error {
 	// ─── Stores ──────────────────────────────────────────────────────────────
 	quoteStore := store.NewQuoteStore(onrampPool)
 	orderStore := store.NewOrderStore(onrampPool)
+	feeStore   := store.NewFeeStore(onrampPool)
 
 	// ─── Background: expire stale quotes ─────────────────────────────────────
 	go func() {
@@ -108,7 +109,7 @@ func run(log *slog.Logger) error {
 	}()
 
 	// ─── Service & router ─────────────────────────────────────────────────────
-	svc := service.NewOnRampService(tc, dc, quoteStore, orderStore, log)
+	svc := service.NewOnRampService(tc, dc, quoteStore, orderStore, feeStore, log)
 	if baasClient != nil {
 		svc = svc.WithOTCDesk(service.OTCDeskConfig{
 			BaasClient: baasClient,

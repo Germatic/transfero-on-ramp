@@ -15,10 +15,12 @@ type Order struct {
 	AccountID           string
 	QuoteID             string
 	TransferoClosingID  string
-	OID                 string // idempotency key
+	OID                 string  // idempotency key
 	BRLAmount           float64
 	USDTAmount          float64
-	Price               float64
+	Price               float64 // adjusted price (= RawPrice * (1 + FeePct))
+	RawPrice            float64 // Transfero's original price before markup
+	FeePct              float64 // markup applied, e.g. 0.002 = 0.2%
 	Settlement          string
 	DestinationAddress  string
 	Network             string
@@ -43,9 +45,9 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 	const sql = `
 		INSERT INTO onramp_orders
 			(account_id, quote_id, transfero_closing_id, oid,
-			 brl_amount, usdt_amount, price, settlement,
-			 destination_address, network, status, pix_payment_group_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			 brl_amount, usdt_amount, price, raw_price, fee_pct,
+			 settlement, destination_address, network, status, pix_payment_group_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id`
 
 	status := o.Status
@@ -55,6 +57,10 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 	var pixGroupID *string
 	if o.PixPaymentGroupID != "" {
 		pixGroupID = &o.PixPaymentGroupID
+	}
+	rawPrice := o.RawPrice
+	if rawPrice == 0 {
+		rawPrice = o.Price
 	}
 
 	var id string
@@ -66,6 +72,8 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 		o.BRLAmount,
 		o.USDTAmount,
 		o.Price,
+		rawPrice,
+		o.FeePct,
 		o.Settlement,
 		o.DestinationAddress,
 		o.Network,
@@ -79,13 +87,14 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 func (s *OrderStore) Get(ctx context.Context, id string) (Order, error) {
 	const sql = `
 		SELECT id, account_id, quote_id, transfero_closing_id, oid,
-		       brl_amount, usdt_amount, price, settlement,
-		       destination_address, network, status, pix_payment_group_id,
+		       brl_amount, usdt_amount, price, raw_price, fee_pct,
+		       settlement, destination_address, network, status, pix_payment_group_id,
 		       created_at, updated_at
 		FROM onramp_orders WHERE id = $1`
 
 	var o Order
 	var pixGroupID *string
+	var rawPrice *float64
 	err := s.pool.QueryRow(ctx, sql, id).Scan(
 		&o.ID,
 		&o.AccountID,
@@ -95,6 +104,8 @@ func (s *OrderStore) Get(ctx context.Context, id string) (Order, error) {
 		&o.BRLAmount,
 		&o.USDTAmount,
 		&o.Price,
+		&rawPrice,
+		&o.FeePct,
 		&o.Settlement,
 		&o.DestinationAddress,
 		&o.Network,
@@ -105,6 +116,9 @@ func (s *OrderStore) Get(ctx context.Context, id string) (Order, error) {
 	)
 	if pixGroupID != nil {
 		o.PixPaymentGroupID = *pixGroupID
+	}
+	if rawPrice != nil {
+		o.RawPrice = *rawPrice
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Order{}, ErrNotFound
@@ -137,8 +151,8 @@ func (s *OrderStore) List(ctx context.Context, page, pageSize int) ([]Order, int
 
 	const sql = `
 		SELECT id, account_id, quote_id, transfero_closing_id, oid,
-		       brl_amount, usdt_amount, price, settlement,
-		       destination_address, network, status, pix_payment_group_id,
+		       brl_amount, usdt_amount, price, raw_price, fee_pct,
+		       settlement, destination_address, network, status, pix_payment_group_id,
 		       created_at, updated_at
 		FROM onramp_orders
 		ORDER BY created_at DESC
@@ -154,6 +168,7 @@ func (s *OrderStore) List(ctx context.Context, page, pageSize int) ([]Order, int
 	for rows.Next() {
 		var o Order
 		var pixGroupID *string
+		var rawPrice *float64
 		if err := rows.Scan(
 			&o.ID,
 			&o.AccountID,
@@ -163,6 +178,8 @@ func (s *OrderStore) List(ctx context.Context, page, pageSize int) ([]Order, int
 			&o.BRLAmount,
 			&o.USDTAmount,
 			&o.Price,
+			&rawPrice,
+			&o.FeePct,
 			&o.Settlement,
 			&o.DestinationAddress,
 			&o.Network,
@@ -175,6 +192,9 @@ func (s *OrderStore) List(ctx context.Context, page, pageSize int) ([]Order, int
 		}
 		if pixGroupID != nil {
 			o.PixPaymentGroupID = *pixGroupID
+		}
+		if rawPrice != nil {
+			o.RawPrice = *rawPrice
 		}
 		orders = append(orders, o)
 	}

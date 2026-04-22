@@ -25,7 +25,9 @@ type Quote struct {
 	TransferoSessionID  string
 	BRLAmount           float64
 	USDTAmount          float64
-	Price               float64
+	Price               float64  // adjusted price shown to the user (= RawPrice * (1 + FeePct))
+	RawPrice            float64  // Transfero's original price before markup
+	FeePct              float64  // markup applied, e.g. 0.002 = 0.2%
 	Settlement          string
 	DestinationAddress  string
 	Network             string
@@ -49,13 +51,17 @@ func (s *QuoteStore) Insert(ctx context.Context, q Quote) (string, error) {
 	const sql = `
 		INSERT INTO onramp_quotes
 			(account_id, transfero_session_id, brl_amount, usdt_amount, price,
-			 settlement, destination_address, network, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			 raw_price, fee_pct, settlement, destination_address, network, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id`
 
 	var addr *string
 	if q.DestinationAddress != "" {
 		addr = &q.DestinationAddress
+	}
+	rawPrice := q.RawPrice
+	if rawPrice == 0 {
+		rawPrice = q.Price
 	}
 
 	var id string
@@ -65,6 +71,8 @@ func (s *QuoteStore) Insert(ctx context.Context, q Quote) (string, error) {
 		q.BRLAmount,
 		q.USDTAmount,
 		q.Price,
+		rawPrice,
+		q.FeePct,
 		q.Settlement,
 		addr,
 		q.Network,
@@ -77,11 +85,13 @@ func (s *QuoteStore) Insert(ctx context.Context, q Quote) (string, error) {
 func (s *QuoteStore) Get(ctx context.Context, id string) (Quote, error) {
 	const sql = `
 		SELECT id, account_id, transfero_session_id, brl_amount, usdt_amount, price,
-		       settlement, destination_address, network, status, expires_at, created_at
+		       raw_price, fee_pct, settlement, destination_address, network, status,
+		       expires_at, created_at
 		FROM onramp_quotes WHERE id = $1`
 
 	var q Quote
 	var addr *string
+	var rawPrice *float64
 	err := s.pool.QueryRow(ctx, sql, id).Scan(
 		&q.ID,
 		&q.AccountID,
@@ -89,6 +99,8 @@ func (s *QuoteStore) Get(ctx context.Context, id string) (Quote, error) {
 		&q.BRLAmount,
 		&q.USDTAmount,
 		&q.Price,
+		&rawPrice,
+		&q.FeePct,
 		&q.Settlement,
 		&addr,
 		&q.Network,
@@ -98,6 +110,9 @@ func (s *QuoteStore) Get(ctx context.Context, id string) (Quote, error) {
 	)
 	if addr != nil {
 		q.DestinationAddress = *addr
+	}
+	if rawPrice != nil {
+		q.RawPrice = *rawPrice
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Quote{}, ErrNotFound
