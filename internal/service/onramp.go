@@ -54,7 +54,9 @@ type QuoteResponse struct {
 	QuoteID    string  `json:"quoteId"`
 	USDTAmount float64 `json:"usdtAmount"`
 	BRLAmount  float64 `json:"brlAmount"`
-	Price      float64 `json:"price"`      // BRL per USDT
+	Price      float64 `json:"price"`              // BRL per USDT (after fee markup)
+	RawPrice   float64 `json:"rawPrice,omitempty"` // Transfero's original price (omitted when fee=0)
+	FeePct     float64 `json:"feePct,omitempty"`   // markup applied, e.g. 0.002 = 0.2%
 	Settlement string  `json:"settlement"`
 	Network    string  `json:"network"`
 	ExpiresAt  string  `json:"expiresAt"` // RFC3339
@@ -75,12 +77,14 @@ type OrderResponse struct {
 	OID                 string  `json:"oid"`
 	USDTAmount          float64 `json:"usdtAmount"`
 	BRLAmount           float64 `json:"brlAmount"`
-	Price               float64 `json:"price"`
+	Price               float64 `json:"price"`              // BRL per USDT (after fee markup)
+	RawPrice            float64 `json:"rawPrice,omitempty"` // Transfero's original price (omitted when fee=0)
+	FeePct              float64 `json:"feePct,omitempty"`   // markup applied, e.g. 0.002 = 0.2%
 	Settlement          string  `json:"settlement"`
 	DestinationAddress  string  `json:"destinationAddress"`
 	Network             string  `json:"network"`
 	Status              string  `json:"status"`
-	PixPaymentGroupID   string  `json:"pixPaymentGroupId,omitempty"` // Transfero paymentGroupId for the BRL PIX
+	PixPaymentGroupID   string  `json:"pixPaymentGroupId,omitempty"`
 	CreatedAt           string  `json:"createdAt"`
 }
 
@@ -116,6 +120,7 @@ type OnRampService struct {
 	dinacore   *dinacore.Client
 	quoteStore *store.QuoteStore
 	orderStore *store.OrderStore
+	feeStore   *store.FeeStore
 	otcDesk    *OTCDeskConfig // if set, BRL is sent via PIX after CloseSession
 	log        *slog.Logger
 }
@@ -126,6 +131,7 @@ func NewOnRampService(
 	dc *dinacore.Client,
 	qs *store.QuoteStore,
 	os *store.OrderStore,
+	fs *store.FeeStore,
 	log *slog.Logger,
 ) *OnRampService {
 	return &OnRampService{
@@ -133,6 +139,7 @@ func NewOnRampService(
 		dinacore:   dc,
 		quoteStore: qs,
 		orderStore: os,
+		feeStore:   fs,
 		log:        log,
 	}
 }
@@ -188,8 +195,23 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		return QuoteResponse{}, fmt.Errorf("invalid price from Transfero: %v", entry.Price)
 	}
 
-	// BRL ÷ price = USDT, rounded to 6 decimal places
-	usdtAmount := math.Round((req.BRLAmount/entry.Price)*1_000_000) / 1_000_000
+	// Look up the per-account fee markup for BRL → USDT (0 when no row exists).
+	feePct := 0.0
+	if s.feeStore != nil && req.AccountID != "" {
+		if f, err := s.feeStore.GetFee(ctx, req.AccountID, "BRL", "USDT"); err != nil {
+			s.log.Warn("fee lookup failed (proceeding with 0%)", "account", req.AccountID, "err", err)
+		} else {
+			feePct = f
+		}
+	}
+
+	// Apply the markup: adjusted_price = raw_price * (1 + fee_pct).
+	// The user receives fewer USDT for the same BRL; the spread is our revenue.
+	rawPrice := entry.Price
+	adjustedPrice := rawPrice * (1 + feePct)
+
+	// BRL ÷ adjusted_price = USDT, rounded to 6 decimal places
+	usdtAmount := math.Round((req.BRLAmount/adjustedPrice)*1_000_000) / 1_000_000
 
 	// Check that the account has enough BRL balance before locking the price
 	if s.dinacore != nil && req.AccountID != "" {
@@ -217,7 +239,9 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		TransferoSessionID: sess.SessionID,
 		BRLAmount:          sess.TotalBRL,
 		USDTAmount:         sess.Amount,
-		Price:              sess.Price,
+		Price:              adjustedPrice,
+		RawPrice:           rawPrice,
+		FeePct:             feePct,
 		Settlement:         sess.Settlement,
 		Network:            req.Network,
 		ExpiresAt:          expiresAt,
@@ -226,15 +250,20 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		return QuoteResponse{}, fmt.Errorf("persist quote: %w", err)
 	}
 
-	return QuoteResponse{
+	resp := QuoteResponse{
 		QuoteID:    quoteID,
 		USDTAmount: sess.Amount,
 		BRLAmount:  sess.TotalBRL,
-		Price:      sess.Price,
+		Price:      adjustedPrice,
 		Settlement: sess.Settlement,
 		Network:    req.Network,
 		ExpiresAt:  expiresAt.Format(time.RFC3339),
-	}, nil
+	}
+	if feePct > 0 {
+		resp.RawPrice = rawPrice
+		resp.FeePct = feePct
+	}
+	return resp, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -345,8 +374,16 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		orderStatus = "confirmed"
 	}
 
-	// 5. Credit USDT to dinacore (best-effort: the trade is done, USDT is in flight)
-	if s.dinacore != nil && req.AccountID != "" {
+	// 5. Credit USDT to dinacore — only for in-swaps where USDT stays in Dinaria
+	//    custody (req.DestinationAddress == ""). For payout-swaps the destination
+	//    address is passed to Transfero at CloseSession and USDT is delivered
+	//    directly to the customer's external wallet; crediting Dinacore here would
+	//    create a phantom balance that does not reflect any real custody holding.
+	//
+	//    When the in-swap flow is implemented (customer holds a USDT balance inside
+	//    Dinaria rather than receiving it on-chain immediately), DestinationAddress
+	//    will be empty and this block will run correctly.
+	if s.dinacore != nil && req.AccountID != "" && req.DestinationAddress == "" {
 		if err := s.dinacore.CreditBalance(ctx, req.AccountID, "USDT", closing.Amount, closing.ClosingID); err != nil {
 			s.log.Error("dinacore USDT credit failed — MANUAL INTERVENTION REQUIRED",
 				"quoteId", req.QuoteID, "closingId", closing.ClosingID,
@@ -357,7 +394,7 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 	// Mark the quote as consumed (best-effort)
 	_ = s.quoteStore.MarkUsed(ctx, req.QuoteID)
 
-	// 6. Persist the confirmed order
+	// 6. Persist the confirmed order (carry fee audit fields from the quote)
 	orderID, err := s.orderStore.Insert(ctx, store.Order{
 		AccountID:          req.AccountID,
 		QuoteID:            req.QuoteID,
@@ -365,7 +402,9 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		OID:                req.QuoteID,
 		BRLAmount:          closing.TotalBRL,
 		USDTAmount:         closing.Amount,
-		Price:              closing.Price,
+		Price:              quote.Price,
+		RawPrice:           quote.RawPrice,
+		FeePct:             quote.FeePct,
 		Settlement:         closing.Settlement,
 		DestinationAddress: req.DestinationAddress,
 		Network:            quote.Network,
@@ -376,21 +415,26 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		return OrderResponse{}, fmt.Errorf("persist order: %w", err)
 	}
 
-	return OrderResponse{
-		OrderID:             orderID,
-		QuoteID:             req.QuoteID,
-		ClosingID:           closing.ClosingID,
-		OID:                 req.QuoteID,
-		USDTAmount:          closing.Amount,
-		BRLAmount:           closing.TotalBRL,
-		Price:               closing.Price,
-		Settlement:          closing.Settlement,
-		DestinationAddress:  quote.DestinationAddress,
-		Network:             quote.Network,
-		Status:              orderStatus,
-		PixPaymentGroupID:   pixPaymentGroupID,
-		CreatedAt:           closing.CreatedAt,
-	}, nil
+	resp := OrderResponse{
+		OrderID:            orderID,
+		QuoteID:            req.QuoteID,
+		ClosingID:          closing.ClosingID,
+		OID:                req.QuoteID,
+		USDTAmount:         closing.Amount,
+		BRLAmount:          closing.TotalBRL,
+		Price:              quote.Price,
+		Settlement:         closing.Settlement,
+		DestinationAddress: quote.DestinationAddress,
+		Network:            quote.Network,
+		Status:             orderStatus,
+		PixPaymentGroupID:  pixPaymentGroupID,
+		CreatedAt:          closing.CreatedAt,
+	}
+	if quote.FeePct > 0 {
+		resp.RawPrice = quote.RawPrice
+		resp.FeePct = quote.FeePct
+	}
+	return resp, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -579,7 +623,7 @@ func (s *OnRampService) ListOrders(ctx context.Context, page, pageSize int) (Ord
 // ─────────────────────────────────────────────────────────────────────────────
 
 func orderToResponse(o store.Order) OrderResponse {
-	return OrderResponse{
+	resp := OrderResponse{
 		OrderID:            o.ID,
 		QuoteID:            o.QuoteID,
 		ClosingID:          o.TransferoClosingID,
@@ -594,6 +638,11 @@ func orderToResponse(o store.Order) OrderResponse {
 		PixPaymentGroupID:  o.PixPaymentGroupID,
 		CreatedAt:          o.CreatedAt.Format(time.RFC3339),
 	}
+	if o.FeePct > 0 {
+		resp.RawPrice = o.RawPrice
+		resp.FeePct = o.FeePct
+	}
+	return resp
 }
 
 func (s *OnRampService) wrapTransferoErr(err error, op string) error {
