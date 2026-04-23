@@ -64,9 +64,14 @@ type QuoteResponse struct {
 
 // OrderRequest is the validated input for ConfirmOrder.
 type OrderRequest struct {
-	AccountID          string // resolved from Bearer token
+	AccountID          string  // resolved from Bearer token
 	QuoteID            string
-	DestinationAddress string // TRC20 wallet where Transfero delivers USDT
+	DestinationAddress string  // TRC20 wallet where Transfero delivers USDT
+	// RequestedBRL is the original merchant-facing BRL amount (before any spread).
+	// When set (ExecuteSettlement path), Dinacore is debited for this amount so that
+	// it stays in sync with Dinapay's merchants.balance. When zero (direct API call),
+	// Dinacore is debited for quote.BRLAmount (Transfero's closing cost).
+	RequestedBRL float64
 }
 
 // OrderResponse is returned after a trade is confirmed.
@@ -294,9 +299,16 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		return OrderResponse{}, ErrQuoteExpired
 	}
 
-	// 2. Debit BRL from dinacore
+	// 2. Debit BRL from dinacore.
+	// Use RequestedBRL (the merchant-facing amount) when available so that Dinacore
+	// stays in sync with Dinapay's merchants.balance. For direct API calls that do
+	// not supply RequestedBRL, fall back to quote.BRLAmount (Transfero's exact cost).
+	dinaDebitAmt := quote.BRLAmount
+	if req.RequestedBRL > 0 {
+		dinaDebitAmt = req.RequestedBRL
+	}
 	if s.dinacore != nil && req.AccountID != "" {
-		if err := s.dinacore.DebitBalance(ctx, req.AccountID, "BRL", quote.BRLAmount, req.QuoteID); err != nil {
+		if err := s.dinacore.DebitBalance(ctx, req.AccountID, "BRL", dinaDebitAmt, req.QuoteID); err != nil {
 			return OrderResponse{}, fmt.Errorf("debit BRL: %w", err)
 		}
 	}
@@ -312,13 +324,13 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		// Verify whether the trade actually happened on Transfero's side
 		confirmed, verifyErr := s.findClosingByOID(ctx, req.QuoteID)
 		if verifyErr != nil || confirmed == nil {
-			// Trade did NOT happen — refund BRL
+			// Trade did NOT happen — refund the same amount that was debited.
 			s.log.Info("trade not found on Transfero; refunding BRL", "quoteId", req.QuoteID)
 			if s.dinacore != nil && req.AccountID != "" {
-				if rfErr := s.dinacore.RefundBRL(ctx, req.AccountID, quote.BRLAmount, req.QuoteID); rfErr != nil {
+				if rfErr := s.dinacore.RefundBRL(ctx, req.AccountID, dinaDebitAmt, req.QuoteID); rfErr != nil {
 					s.log.Error("BRL refund failed — MANUAL INTERVENTION REQUIRED",
 						"quoteId", req.QuoteID, "account", req.AccountID,
-						"brlAmount", quote.BRLAmount, "err", rfErr)
+						"brlAmount", dinaDebitAmt, "err", rfErr)
 				}
 			}
 			return OrderResponse{}, fmt.Errorf("close session: %w", closeErr)
@@ -493,6 +505,7 @@ func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteReques
 		AccountID:          req.AccountID,
 		QuoteID:            quote.QuoteID,
 		DestinationAddress: req.Address,
+		RequestedBRL:       req.BRLAmount, // full merchant amount; keeps Dinacore in sync with Dinapay
 	})
 	if err != nil {
 		return ExecuteResponse{}, fmt.Errorf("confirm order: %w", err)
