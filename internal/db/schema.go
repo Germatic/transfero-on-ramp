@@ -80,4 +80,17 @@ CREATE TABLE IF NOT EXISTS onramp_fees (
 
 CREATE INDEX IF NOT EXISTS onramp_fees_lookup
   ON onramp_fees (account_id, from_currency, to_currency, effective_from DESC);
+
+-- -------------------------------------------------------
+-- Per-account on-ramp settings.
+-- max_d0_premium_pct: maximum allowed percentage by which the D0 settlement
+--   price may exceed the spot price before the trade is rejected.
+--   NULL = no guard (all prices accepted).
+--   e.g. 0.036000 = 0.036%.
+-- -------------------------------------------------------
+CREATE TABLE IF NOT EXISTS onramp_account_settings (
+  account_id           TEXT        PRIMARY KEY,
+  max_d0_premium_pct   NUMERIC(10,6),               -- NULL = disabled
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `

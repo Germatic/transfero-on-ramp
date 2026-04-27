@@ -204,7 +204,8 @@ func handleGetRates(svc *service.OnRampService, log *slog.Logger) http.HandlerFu
 			settlement = "D0"
 		}
 
-		resp, err := svc.GetIndicativeRates(r.Context(), settlement)
+		account, _ := auth.FromContext(r.Context())
+		resp, err := svc.GetIndicativeRates(r.Context(), account.ID, settlement)
 		if err != nil {
 			log.Warn("get rates failed", "err", err)
 			if writeProviderErr(w, err) {

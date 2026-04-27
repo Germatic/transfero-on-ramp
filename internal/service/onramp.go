@@ -138,13 +138,14 @@ type OTCDeskConfig struct {
 
 // OnRampService orchestrates quote creation and order confirmation.
 type OnRampService struct {
-	transfero  *transfero.Client
-	dinacore   *dinacore.Client
-	quoteStore *store.QuoteStore
-	orderStore *store.OrderStore
-	feeStore   *store.FeeStore
-	otcDesk    *OTCDeskConfig // if set, BRL is sent via PIX after CloseSession
-	log        *slog.Logger
+	transfero     *transfero.Client
+	dinacore      *dinacore.Client
+	quoteStore    *store.QuoteStore
+	orderStore    *store.OrderStore
+	feeStore      *store.FeeStore
+	settingsStore *store.SettingsStore
+	otcDesk       *OTCDeskConfig // if set, BRL is sent via PIX after CloseSession
+	log           *slog.Logger
 }
 
 // NewOnRampService creates an OnRampService with its required dependencies.
@@ -154,15 +155,17 @@ func NewOnRampService(
 	qs *store.QuoteStore,
 	os *store.OrderStore,
 	fs *store.FeeStore,
+	ss *store.SettingsStore,
 	log *slog.Logger,
 ) *OnRampService {
 	return &OnRampService{
-		transfero:  tc,
-		dinacore:   dc,
-		quoteStore: qs,
-		orderStore: os,
-		feeStore:   fs,
-		log:        log,
+		transfero:     tc,
+		dinacore:      dc,
+		quoteStore:    qs,
+		orderStore:    os,
+		feeStore:      fs,
+		settingsStore: ss,
+		log:           log,
 	}
 }
 
@@ -548,12 +551,15 @@ type RatesResponse struct {
 	FromCurrency string  `json:"fromCurrency"`
 	ToCurrency   string  `json:"toCurrency"`
 	Price        float64 `json:"price"`
+	Spot         float64 `json:"spot"`
 	Settlement   string  `json:"settlement"`
 	IndicativeAt string  `json:"indicativeAt"`
 }
 
 // GetIndicativeRates returns the current indicative BRL→USDT price without locking a session.
-func (s *OnRampService) GetIndicativeRates(ctx context.Context, settlement string) (RatesResponse, error) {
+// If the account has a max_d0_premium_pct configured and the D0 price exceeds
+// spot × (1 + maxPremium/100), a MARKET_CONDITION ProviderError is returned.
+func (s *OnRampService) GetIndicativeRates(ctx context.Context, accountID, settlement string) (RatesResponse, error) {
 	if settlement == "" {
 		settlement = "D0"
 	}
@@ -580,10 +586,31 @@ func (s *OnRampService) GetIndicativeRates(ctx context.Context, settlement strin
 		return RatesResponse{}, fmt.Errorf("invalid settlement %q", settlement)
 	}
 
+	// Guard: reject if D0 premium over spot exceeds the account's configured threshold.
+	if s.settingsStore != nil && accountID != "" {
+		maxPremium, err := s.settingsStore.GetMaxD0PremiumPct(ctx, accountID)
+		if err != nil {
+			s.log.Warn("failed to load max_d0_premium_pct; skipping guard", "account", accountID, "err", err)
+		} else if maxPremium != nil && grid.Spot > 0 {
+			ceiling := grid.Spot * (1 + *maxPremium/100)
+			if entry.Price > ceiling {
+				s.log.Info("MARKET_CONDITION: D0 premium exceeds threshold",
+					"account", accountID,
+					"spot", grid.Spot,
+					"d0", entry.Price,
+					"max_premium_pct", *maxPremium,
+					"ceiling", ceiling,
+				)
+				return RatesResponse{}, &ProviderError{Status: 422, Code: "MARKET_CONDITION"}
+			}
+		}
+	}
+
 	return RatesResponse{
 		FromCurrency: "BRL",
 		ToCurrency:   "USDT",
 		Price:        entry.Price,
+		Spot:         grid.Spot,
 		Settlement:   settlement,
 		IndicativeAt: time.Now().UTC().Format(time.RFC3339),
 	}, nil
