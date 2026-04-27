@@ -119,8 +119,8 @@ func runCycle(ctx context.Context, log *slog.Logger, orders *store.OrderStore, t
 			return
 		}
 		checkOrder(ctx, log, orders, tron, dinapayPool, o)
-		// Small pause between Tronscan calls to stay within rate limits.
-		time.Sleep(500 * time.Millisecond)
+		// 1.5s pause between Tronscan calls — free API key allows 1 RPS.
+		time.Sleep(1500 * time.Millisecond)
 	}
 }
 
