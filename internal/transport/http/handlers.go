@@ -26,6 +26,20 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+// writeProviderErr writes a structured provider error response with only
+// "status" and "code" fields. Returns true so callers can return early.
+func writeProviderErr(w http.ResponseWriter, err error) bool {
+	var pe *service.ProviderError
+	if !errors.As(err, &pe) {
+		return false
+	}
+	writeJSON(w, pe.Status, map[string]any{
+		"status": pe.Status,
+		"code":   pe.Code,
+	})
+	return true
+}
+
 func decode(r *http.Request, v any) error {
 	return json.NewDecoder(r.Body).Decode(v)
 }
@@ -75,8 +89,11 @@ func handleCreateQuote(svc *service.OnRampService, log *slog.Logger) http.Handle
 			Network:    req.Network,
 		})
 		if err != nil {
-			code, msg := mapServiceErr(err)
 			log.Warn("create quote failed", "err", err)
+			if writeProviderErr(w, err) {
+				return
+			}
+			code, msg := mapServiceErr(err)
 			writeError(w, code, msg)
 			return
 		}
@@ -123,8 +140,11 @@ func handleConfirmOrder(svc *service.OnRampService, log *slog.Logger) http.Handl
 			DestinationAddress: req.DestinationAddress,
 		})
 		if err != nil {
-			code, msg := mapServiceErr(err)
 			log.Warn("confirm order failed", "quoteId", req.QuoteID, "err", err)
+			if writeProviderErr(w, err) {
+				return
+			}
+			code, msg := mapServiceErr(err)
 			writeError(w, code, msg)
 			return
 		}
@@ -186,8 +206,11 @@ func handleGetRates(svc *service.OnRampService, log *slog.Logger) http.HandlerFu
 
 		resp, err := svc.GetIndicativeRates(r.Context(), settlement)
 		if err != nil {
-			code, msg := mapServiceErr(err)
 			log.Warn("get rates failed", "err", err)
+			if writeProviderErr(w, err) {
+				return
+			}
+			code, msg := mapServiceErr(err)
 			writeError(w, code, msg)
 			return
 		}
@@ -240,8 +263,11 @@ func handleInternalExecute(svc *service.OnRampService, log *slog.Logger) http.Ha
 			Settlement: req.Settlement,
 		})
 		if err != nil {
-			code, msg := mapServiceErr(err)
 			log.Warn("internal execute failed", "payoutId", req.PayoutID, "err", err)
+			if writeProviderErr(w, err) {
+				return
+			}
+			code, msg := mapServiceErr(err)
 			writeError(w, code, msg)
 			return
 		}
@@ -256,8 +282,6 @@ func handleInternalExecute(svc *service.OnRampService, log *slog.Logger) http.Ha
 
 func mapServiceErr(err error) (int, string) {
 	switch {
-	case errors.Is(err, service.ErrMarketClosed):
-		return http.StatusServiceUnavailable, "market closed"
 	case errors.Is(err, service.ErrQuoteExpired):
 		return http.StatusGone, "quote expired"
 	case errors.Is(err, service.ErrQuoteUsed):

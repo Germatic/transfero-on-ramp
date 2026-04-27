@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"regexp"
+	"strings"
 	"time"
 
 	"transfero-on-ramp/internal/dinacore"
@@ -30,12 +32,27 @@ import (
 
 // Sentinel errors that handlers inspect to return correct HTTP status codes.
 var (
-	ErrMarketClosed  = errors.New("outside market hours")
-	ErrQuoteExpired  = store.ErrQuoteExpired
-	ErrQuoteUsed     = store.ErrQuoteUsed
-	ErrNotFound      = store.ErrNotFound
+	ErrMarketClosed        = errors.New("outside market hours")
+	ErrQuoteExpired        = store.ErrQuoteExpired
+	ErrQuoteUsed           = store.ErrQuoteUsed
+	ErrNotFound            = store.ErrNotFound
 	ErrInsufficientBalance = errors.New("insufficient BRL balance")
 )
+
+// vendorRe matches any case-insensitive occurrence of the upstream vendor name.
+var vendorRe = regexp.MustCompile(`(?i)transfero`)
+
+// ProviderError is returned when the upstream provider returns a structured
+// error. It carries the HTTP status and machine-readable code from the
+// provider, with any vendor-identifying strings scrubbed out.
+type ProviderError struct {
+	Status int
+	Code   string
+}
+
+func (e *ProviderError) Error() string {
+	return fmt.Sprintf("provider error %d: %s", e.Status, e.Code)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Input / output types
@@ -660,8 +677,12 @@ func orderToResponse(o store.Order) OrderResponse {
 
 func (s *OnRampService) wrapTransferoErr(err error, op string) error {
 	var apiErr *transfero.APIError
-	if errors.As(err, &apiErr) && (apiErr.Status == 403) {
-		return ErrMarketClosed
+	if errors.As(err, &apiErr) {
+		code := strings.TrimSpace(vendorRe.ReplaceAllString(apiErr.Code, ""))
+		if code == "" {
+			code = strings.TrimSpace(vendorRe.ReplaceAllString(apiErr.Title, ""))
+		}
+		return &ProviderError{Status: apiErr.Status, Code: code}
 	}
 	return fmt.Errorf("%s: %w", op, err)
 }
