@@ -205,7 +205,13 @@ func handleGetRates(svc *service.OnRampService, log *slog.Logger) http.HandlerFu
 		}
 
 		account, _ := auth.FromContext(r.Context())
-		resp, err := svc.GetIndicativeRates(r.Context(), account.ID, settlement)
+		// Dinapay proxies calls using its own internal key (account="static").
+		// The real end-customer account is forwarded via X-Account-ID header.
+		accountID := r.Header.Get("X-Account-ID")
+		if accountID == "" {
+			accountID = account.ID
+		}
+		resp, err := svc.GetIndicativeRates(r.Context(), accountID, settlement)
 		if err != nil {
 			log.Warn("get rates failed", "err", err)
 			if writeProviderErr(w, err) {
