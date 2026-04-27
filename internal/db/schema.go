@@ -90,7 +90,9 @@ CREATE INDEX IF NOT EXISTS onramp_fees_lookup
 -- -------------------------------------------------------
 CREATE TABLE IF NOT EXISTS onramp_account_settings (
   account_id           TEXT        PRIMARY KEY,
-  max_d0_premium_pct   NUMERIC(10,6),               -- NULL = disabled
+  max_d0_premium_pct   NUMERIC(10,6),               -- NULL = disabled; i.e. 0.36 % is zero point 36 percent
+  description          TEXT,                        -- human-readable note, e.g. "BPN: max 0.36% D0 premium over spot"
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS description TEXT;
 `
