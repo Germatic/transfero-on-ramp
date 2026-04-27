@@ -84,6 +84,7 @@ type OrderRequest struct {
 	AccountID          string  // resolved from Bearer token
 	QuoteID            string
 	DestinationAddress string  // TRC20 wallet where Transfero delivers USDT
+	PayoutID           string  // dinapay payout row ID — stored so reconciler can mark it completed
 	// RequestedBRL is the original merchant-facing BRL amount (before any spread).
 	// When set (ExecuteSettlement path), Dinacore is debited for this amount so that
 	// it stays in sync with Dinapay's merchants.balance. When zero (direct API call),
@@ -389,19 +390,20 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 				"brlAmount", closing.TotalBRL, "otcPixKey", s.otcDesk.PIXKey, "err", pixErr)
 			// Persist so operators can see it and retry
 			_ = s.quoteStore.MarkUsed(ctx, req.QuoteID)
-			orderID, _ := s.orderStore.Insert(ctx, store.Order{
-				AccountID:          req.AccountID,
-				QuoteID:            req.QuoteID,
-				TransferoClosingID: closing.ClosingID,
-				OID:                req.QuoteID,
-				BRLAmount:          closing.TotalBRL,
-				USDTAmount:         closing.Amount,
-				Price:              closing.Price,
-				Settlement:         closing.Settlement,
-				DestinationAddress: req.DestinationAddress,
-				Network:            quote.Network,
-				Status:             "payment_failed",
-			})
+		orderID, _ := s.orderStore.Insert(ctx, store.Order{
+			AccountID:          req.AccountID,
+			QuoteID:            req.QuoteID,
+			TransferoClosingID: closing.ClosingID,
+			OID:                req.QuoteID,
+			BRLAmount:          closing.TotalBRL,
+			USDTAmount:         closing.Amount,
+			Price:              closing.Price,
+			Settlement:         closing.Settlement,
+			DestinationAddress: req.DestinationAddress,
+			Network:            quote.Network,
+			Status:             "payment_failed",
+			PayoutID:           req.PayoutID,
+		})
 			_ = orderID
 			return OrderResponse{}, fmt.Errorf("send BRL to OTC desk: %w", pixErr)
 		}
@@ -451,6 +453,7 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		Network:            quote.Network,
 		Status:             orderStatus,
 		PixPaymentGroupID:  pixPaymentGroupID,
+		PayoutID:           req.PayoutID,
 	})
 	if err != nil {
 		return OrderResponse{}, fmt.Errorf("persist order: %w", err)
@@ -534,6 +537,7 @@ func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteReques
 		AccountID:          req.AccountID,
 		QuoteID:            quote.QuoteID,
 		DestinationAddress: req.Address,
+		PayoutID:           req.PayoutID, // stored in onramp_orders so reconciler can complete the payout
 		RequestedBRL:       req.BRLAmount, // full merchant amount; keeps Dinacore in sync with Dinapay
 	})
 	if err != nil {

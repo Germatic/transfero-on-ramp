@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
 	"transfero-on-ramp/internal/db"
@@ -66,6 +67,21 @@ func main() {
 	orderStore := store.NewOrderStore(pool)
 	tron := tronscan.New(os.Getenv("TRONSCAN_API_KEY"))
 
+	// Optional: dinapay DB connection so we can flip payout → completed on delivery.
+	var dinapayPool *pgxpool.Pool
+	if dinapayDBURL := os.Getenv("DINAPAY_DB_URL"); dinapayDBURL != "" {
+		p, err := db.NewPool(context.Background(), dinapayDBURL)
+		if err != nil {
+			log.Warn("dinapay DB unavailable — payouts will not be auto-completed on delivery", "err", err)
+		} else {
+			dinapayPool = p
+			defer dinapayPool.Close()
+			log.Info("dinapay DB ready — will mark payouts completed on delivery")
+		}
+	} else {
+		log.Warn("DINAPAY_DB_URL not set — payouts will not be auto-completed on delivery")
+	}
+
 	log.Info("settlement reconciler started", "pollInterval", pollInterval.String(), "minOrderAge", minOrderAge.String())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -75,19 +91,19 @@ func main() {
 	defer ticker.Stop()
 
 	// Run immediately on startup, then on each tick.
-	runCycle(ctx, log, orderStore, tron)
+	runCycle(ctx, log, orderStore, tron, dinapayPool)
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("reconciler shutting down")
 			return
 		case <-ticker.C:
-			runCycle(ctx, log, orderStore, tron)
+			runCycle(ctx, log, orderStore, tron, dinapayPool)
 		}
 	}
 }
 
-func runCycle(ctx context.Context, log *slog.Logger, orders *store.OrderStore, tron *tronscan.Client) {
+func runCycle(ctx context.Context, log *slog.Logger, orders *store.OrderStore, tron *tronscan.Client, dinapayPool *pgxpool.Pool) {
 	pending, err := orders.ListAwaitingSettlement(ctx, minOrderAge, batchSize)
 	if err != nil {
 		log.Warn("list awaiting_settlement failed", "err", err)
@@ -102,20 +118,19 @@ func runCycle(ctx context.Context, log *slog.Logger, orders *store.OrderStore, t
 		if ctx.Err() != nil {
 			return
 		}
-		checkOrder(ctx, log, orders, tron, o)
+		checkOrder(ctx, log, orders, tron, dinapayPool, o)
 		// Small pause between Tronscan calls to stay within rate limits.
 		time.Sleep(500 * time.Millisecond)
 	}
 }
 
-func checkOrder(ctx context.Context, log *slog.Logger, orders *store.OrderStore, tron *tronscan.Client, o store.Order) {
+func checkOrder(ctx context.Context, log *slog.Logger, orders *store.OrderStore, tron *tronscan.Client, dinapayPool *pgxpool.Pool, o store.Order) {
 	log = log.With("order_id", o.ID, "address", o.DestinationAddress, "usdt", o.USDTAmount)
 
 	// Flag orders that have been waiting too long.
 	if time.Since(o.CreatedAt) > giveUpAfter {
 		log.Error("order exceeded settlement timeout — manual review required",
 			"age", time.Since(o.CreatedAt).String())
-		// Transition to a distinct status so ops can identify it.
 		_ = orders.UpdateStatus(ctx, o.ID, "settlement_timeout")
 		return
 	}
@@ -141,4 +156,20 @@ func checkOrder(ctx context.Context, log *slog.Logger, orders *store.OrderStore,
 		"on_chain_amount", tx.Amount,
 		"block_time", tx.BlockTime.Format(time.RFC3339),
 	)
+
+	// Flip the dinapay payout from onramp_processing → completed.
+	if dinapayPool != nil && o.PayoutID != "" {
+		_, err := dinapayPool.Exec(ctx, `
+			UPDATE payouts SET
+				status       = 'completed',
+				completed_at = now(),
+				updated_at   = now()
+			WHERE id = $1 AND status = 'onramp_processing'
+		`, o.PayoutID)
+		if err != nil {
+			log.Error("failed to mark dinapay payout completed", "payout_id", o.PayoutID, "err", err)
+		} else {
+			log.Info("dinapay payout marked completed", "payout_id", o.PayoutID)
+		}
+	}
 }

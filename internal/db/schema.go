@@ -60,6 +60,8 @@ ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS raw_price NUMERIC(20,6);
 ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS tx_hash TEXT;
 -- delivered_at: timestamp when on-chain delivery was confirmed
 ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+-- payout_id: foreign key back to the dinapay payouts table row
+ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS payout_id TEXT;
 
 CREATE INDEX IF NOT EXISTS onramp_orders_account_id ON onramp_orders (account_id);
 CREATE INDEX IF NOT EXISTS onramp_orders_quote_id   ON onramp_orders (quote_id);

@@ -26,6 +26,7 @@ type Order struct {
 	Network             string
 	Status              string     // awaiting_settlement | confirmed | delivering | delivered | failed | payment_failed
 	PixPaymentGroupID   string     // Transfero paymentGroupId for the BRL PIX sent to OTC desk
+	PayoutID            string     // dinapay payout row ID — used by reconciler to mark payout completed
 	TxHash              string     // on-chain Tron tx hash, set by settlement reconciler
 	DeliveredAt         *time.Time // timestamp of on-chain delivery confirmation
 	CreatedAt           time.Time
@@ -48,8 +49,8 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 		INSERT INTO onramp_orders
 			(account_id, quote_id, transfero_closing_id, oid,
 			 brl_amount, usdt_amount, price, raw_price, fee_pct,
-			 settlement, destination_address, network, status, pix_payment_group_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			 settlement, destination_address, network, status, pix_payment_group_id, payout_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING id`
 
 	status := o.Status
@@ -59,6 +60,10 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 	var pixGroupID *string
 	if o.PixPaymentGroupID != "" {
 		pixGroupID = &o.PixPaymentGroupID
+	}
+	var payoutID *string
+	if o.PayoutID != "" {
+		payoutID = &o.PayoutID
 	}
 	rawPrice := o.RawPrice
 	if rawPrice == 0 {
@@ -81,6 +86,7 @@ func (s *OrderStore) Insert(ctx context.Context, o Order) (string, error) {
 		o.Network,
 		status,
 		pixGroupID,
+		payoutID,
 	).Scan(&id)
 	return id, err
 }
@@ -152,7 +158,8 @@ func (s *OrderStore) MarkDelivered(ctx context.Context, id, txHash string) error
 // older than minAge and have a destination_address set (on-chain delivery).
 func (s *OrderStore) ListAwaitingSettlement(ctx context.Context, minAge time.Duration, limit int) ([]Order, error) {
 	const sql = `
-		SELECT id, account_id, usdt_amount, destination_address, network, created_at
+		SELECT id, account_id, usdt_amount, destination_address, network, created_at,
+		       COALESCE(payout_id, '')
 		FROM onramp_orders
 		WHERE status = 'awaiting_settlement'
 		  AND destination_address <> ''
@@ -169,7 +176,7 @@ func (s *OrderStore) ListAwaitingSettlement(ctx context.Context, minAge time.Dur
 	var orders []Order
 	for rows.Next() {
 		var o Order
-		if err := rows.Scan(&o.ID, &o.AccountID, &o.USDTAmount, &o.DestinationAddress, &o.Network, &o.CreatedAt); err != nil {
+		if err := rows.Scan(&o.ID, &o.AccountID, &o.USDTAmount, &o.DestinationAddress, &o.Network, &o.CreatedAt, &o.PayoutID); err != nil {
 			return nil, err
 		}
 		orders = append(orders, o)
