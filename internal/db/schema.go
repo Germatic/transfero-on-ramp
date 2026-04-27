@@ -56,6 +56,11 @@ ALTER TABLE onramp_quotes ADD COLUMN IF NOT EXISTS raw_price NUMERIC(20,6);
 ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS fee_pct   NUMERIC(8,6) NOT NULL DEFAULT 0;
 ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS raw_price NUMERIC(20,6);
 
+-- tx_hash: on-chain Tron transaction hash set by the settlement reconciler
+ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS tx_hash TEXT;
+-- delivered_at: timestamp when on-chain delivery was confirmed
+ALTER TABLE onramp_orders ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS onramp_orders_account_id ON onramp_orders (account_id);
 CREATE INDEX IF NOT EXISTS onramp_orders_quote_id   ON onramp_orders (quote_id);
 CREATE INDEX IF NOT EXISTS onramp_orders_status     ON onramp_orders (status);

@@ -24,8 +24,10 @@ type Order struct {
 	Settlement          string
 	DestinationAddress  string
 	Network             string
-	Status              string // awaiting_settlement | confirmed | delivering | delivered | failed | payment_failed
-	PixPaymentGroupID   string // Transfero paymentGroupId for the BRL PIX sent to OTC desk
+	Status              string     // awaiting_settlement | confirmed | delivering | delivered | failed | payment_failed
+	PixPaymentGroupID   string     // Transfero paymentGroupId for the BRL PIX sent to OTC desk
+	TxHash              string     // on-chain Tron tx hash, set by settlement reconciler
+	DeliveredAt         *time.Time // timestamp of on-chain delivery confirmation
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 }
@@ -131,6 +133,48 @@ func (s *OrderStore) UpdateStatus(ctx context.Context, id, status string) error 
 	const sql = `UPDATE onramp_orders SET status = $2, updated_at = now() WHERE id = $1`
 	_, err := s.pool.Exec(ctx, sql, id, status)
 	return err
+}
+
+// MarkDelivered transitions an order to "delivered" and records the on-chain tx hash.
+func (s *OrderStore) MarkDelivered(ctx context.Context, id, txHash string) error {
+	const sql = `
+		UPDATE onramp_orders
+		SET status       = 'delivered',
+		    tx_hash      = $2,
+		    delivered_at = now(),
+		    updated_at   = now()
+		WHERE id = $1 AND status = 'awaiting_settlement'`
+	_, err := s.pool.Exec(ctx, sql, id, txHash)
+	return err
+}
+
+// ListAwaitingSettlement returns orders stuck in awaiting_settlement that are
+// older than minAge and have a destination_address set (on-chain delivery).
+func (s *OrderStore) ListAwaitingSettlement(ctx context.Context, minAge time.Duration, limit int) ([]Order, error) {
+	const sql = `
+		SELECT id, account_id, usdt_amount, destination_address, network, created_at
+		FROM onramp_orders
+		WHERE status = 'awaiting_settlement'
+		  AND destination_address <> ''
+		  AND created_at < now() - $1::interval
+		ORDER BY created_at ASC
+		LIMIT $2`
+
+	rows, err := s.pool.Query(ctx, sql, minAge.String(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var orders []Order
+	for rows.Next() {
+		var o Order
+		if err := rows.Scan(&o.ID, &o.AccountID, &o.USDTAmount, &o.DestinationAddress, &o.Network, &o.CreatedAt); err != nil {
+			return nil, err
+		}
+		orders = append(orders, o)
+	}
+	return orders, rows.Err()
 }
 
 // List returns a page of orders, newest first.
