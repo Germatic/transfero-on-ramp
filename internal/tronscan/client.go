@@ -44,10 +44,24 @@ type Client struct {
 // New creates a Tronscan client.
 // apiKey may be empty — the public API works without one at lower rate limits.
 func New(apiKey string) *Client {
+	// Preserve the TRON-PRO-API-KEY header when the API redirects (301) to
+	// the new endpoint path (/api/new/token_trc20/transfers).
+	apiKeyVal := apiKey
+	transport := &http.Transport{}
+	httpClient := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if apiKeyVal != "" {
+				req.Header.Set("TRON-PRO-API-KEY", apiKeyVal)
+			}
+			return nil
+		},
+	}
 	return &Client{
 		baseURL: BaseURL,
 		apiKey:  apiKey,
-		http:    &http.Client{Timeout: 15 * time.Second},
+		http:    httpClient,
 	}
 }
 
@@ -63,7 +77,7 @@ func (c *Client) FindInboundUSDT(ctx context.Context, toAddress string, expected
 	params.Set("limit", "20")
 	params.Set("start", "0")
 
-	endpoint := c.baseURL + "/api/token_trc20/transfers?" + params.Encode()
+	endpoint := c.baseURL + "/api/new/token_trc20/transfers?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return Transfer{}, false, err
@@ -84,25 +98,26 @@ func (c *Client) FindInboundUSDT(ctx context.Context, toAddress string, expected
 	}
 
 	var result struct {
-		Data []struct {
-			Hash            string `json:"hash"`
-			From            string `json:"from"`
-			To              string `json:"to"`
-			Amount          string `json:"amount"`       // raw integer string
-			Confirmed       int    `json:"confirmed"`    // 1 = confirmed
-			BlockTimestamp  int64  `json:"block_timestamp"`
-			ContractRet     string `json:"contract_ret"` // "SUCCESS"
-		} `json:"data"`
+		Transfers []struct {
+			TxID        string `json:"transaction_id"`
+			From        string `json:"from_address"`
+			To          string `json:"to_address"`
+			Quant       string `json:"quant"`       // raw integer string (amount × 10^6)
+			Confirmed   bool   `json:"confirmed"`
+			BlockTs     int64  `json:"block_ts"`    // milliseconds
+			ContractRet string `json:"contractRet"` // "SUCCESS"
+			FinalResult string `json:"finalResult"` // "SUCCESS"
+		} `json:"token_transfers"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return Transfer{}, false, fmt.Errorf("tronscan decode: %w", err)
 	}
 
-	for _, tx := range result.Data {
-		if tx.Confirmed != 1 || tx.ContractRet != "SUCCESS" {
+	for _, tx := range result.Transfers {
+		if !tx.Confirmed || (tx.ContractRet != "SUCCESS" && tx.FinalResult != "SUCCESS") {
 			continue
 		}
-		rawAmt, err := strconv.ParseInt(tx.Amount, 10, 64)
+		rawAmt, err := strconv.ParseInt(tx.Quant, 10, 64)
 		if err != nil {
 			continue
 		}
@@ -114,9 +129,9 @@ func (c *Client) FindInboundUSDT(ctx context.Context, toAddress string, expected
 			diff = -diff
 		}
 		if diff <= 0.01 {
-			blockTime := time.UnixMilli(tx.BlockTimestamp).UTC()
+			blockTime := time.UnixMilli(tx.BlockTs).UTC()
 			return Transfer{
-				TxHash:    tx.Hash,
+				TxHash:    tx.TxID,
 				From:      tx.From,
 				To:        tx.To,
 				Amount:    amount,
