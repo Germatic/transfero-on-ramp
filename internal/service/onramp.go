@@ -220,6 +220,11 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		return QuoteResponse{}, fmt.Errorf("invalid price from Transfero: %v", entry.Price)
 	}
 
+	// Guard: block the trade if market conditions are dislocated for this account.
+	if s.marketConditionFor(ctx, req.AccountID, grid.Spot, entry.Price) == MarketConditionDislocation {
+		return QuoteResponse{}, &ProviderError{Status: 422, Code: "MARKET_DISLOCATION"}
+	}
+
 	// Look up the per-account fee markup for BRL → USDT (0 when no row exists).
 	feePct := 0.0
 	if s.feeStore != nil && req.AccountID != "" {
@@ -546,19 +551,61 @@ func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteReques
 // Indicative rates
 // ─────────────────────────────────────────────────────────────────────────────
 
+// MarketConditionNormal and MarketConditionDislocation are the two possible
+// values for the MarketCondition field in RatesResponse.
+const (
+	MarketConditionNormal      = "NORMAL"
+	MarketConditionDislocation = "MARKET_DISLOCATION"
+)
+
 // RatesResponse is the response for GET /v1/rates.
 type RatesResponse struct {
-	FromCurrency string  `json:"fromCurrency"`
-	ToCurrency   string  `json:"toCurrency"`
-	Price        float64 `json:"price"`
-	Spot         float64 `json:"spot"`
-	Settlement   string  `json:"settlement"`
-	IndicativeAt string  `json:"indicativeAt"`
+	FromCurrency    string  `json:"fromCurrency"`
+	ToCurrency      string  `json:"toCurrency"`
+	Price           float64 `json:"price"`
+	Spot            float64 `json:"spot"`
+	Settlement      string  `json:"settlement"`
+	MarketCondition string  `json:"marketCondition"` // "NORMAL" | "MARKET_DISLOCATION"
+	IndicativeAt    string  `json:"indicativeAt"`
+}
+
+// marketConditionFor evaluates whether the settlement price breaches the
+// account's configured max D0 premium over spot.
+// Returns MarketConditionNormal when:
+//   - no settings row exists for the account
+//   - spot is zero (can't compute a ratio)
+//   - settings lookup fails (fails open, logs a warning)
+//
+// Returns MarketConditionDislocation when price > spot × (1 + maxPremium/100).
+func (s *OnRampService) marketConditionFor(ctx context.Context, accountID string, spot, price float64) string {
+	if s.settingsStore == nil || accountID == "" || spot <= 0 {
+		return MarketConditionNormal
+	}
+	maxPremium, err := s.settingsStore.GetMaxD0PremiumPct(ctx, accountID)
+	if err != nil {
+		s.log.Warn("failed to load max_d0_premium_pct; treating as NORMAL", "account", accountID, "err", err)
+		return MarketConditionNormal
+	}
+	if maxPremium == nil {
+		return MarketConditionNormal
+	}
+	ceiling := spot * (1 + *maxPremium/100)
+	if price > ceiling {
+		s.log.Info("MARKET_DISLOCATION: D0 premium exceeds threshold",
+			"account", accountID,
+			"spot", spot,
+			"price", price,
+			"max_premium_pct", *maxPremium,
+			"ceiling", ceiling,
+		)
+		return MarketConditionDislocation
+	}
+	return MarketConditionNormal
 }
 
 // GetIndicativeRates returns the current indicative BRL→USDT price without locking a session.
-// If the account has a max_d0_premium_pct configured and the D0 price exceeds
-// spot × (1 + maxPremium/100), a MARKET_CONDITION ProviderError is returned.
+// It always returns price data; the MarketCondition field signals whether the
+// D0 premium is within the account's configured threshold.
 func (s *OnRampService) GetIndicativeRates(ctx context.Context, accountID, settlement string) (RatesResponse, error) {
 	if settlement == "" {
 		settlement = "D0"
@@ -586,33 +633,16 @@ func (s *OnRampService) GetIndicativeRates(ctx context.Context, accountID, settl
 		return RatesResponse{}, fmt.Errorf("invalid settlement %q", settlement)
 	}
 
-	// Guard: reject if D0 premium over spot exceeds the account's configured threshold.
-	if s.settingsStore != nil && accountID != "" {
-		maxPremium, err := s.settingsStore.GetMaxD0PremiumPct(ctx, accountID)
-		if err != nil {
-			s.log.Warn("failed to load max_d0_premium_pct; skipping guard", "account", accountID, "err", err)
-		} else if maxPremium != nil && grid.Spot > 0 {
-			ceiling := grid.Spot * (1 + *maxPremium/100)
-			if entry.Price > ceiling {
-				s.log.Info("MARKET_CONDITION: D0 premium exceeds threshold",
-					"account", accountID,
-					"spot", grid.Spot,
-					"d0", entry.Price,
-					"max_premium_pct", *maxPremium,
-					"ceiling", ceiling,
-				)
-				return RatesResponse{}, &ProviderError{Status: 422, Code: "MARKET_CONDITION"}
-			}
-		}
-	}
+	condition := s.marketConditionFor(ctx, accountID, grid.Spot, entry.Price)
 
 	return RatesResponse{
-		FromCurrency: "BRL",
-		ToCurrency:   "USDT",
-		Price:        entry.Price,
-		Spot:         grid.Spot,
-		Settlement:   settlement,
-		IndicativeAt: time.Now().UTC().Format(time.RFC3339),
+		FromCurrency:    "BRL",
+		ToCurrency:      "USDT",
+		Price:           entry.Price,
+		Spot:            grid.Spot,
+		Settlement:      settlement,
+		MarketCondition: condition,
+		IndicativeAt:    time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
 
