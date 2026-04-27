@@ -220,25 +220,29 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		return QuoteResponse{}, fmt.Errorf("invalid price from Transfero: %v", entry.Price)
 	}
 
-	// Guard: block the trade if market conditions are dislocated for this account.
-	if s.marketConditionFor(ctx, req.AccountID, grid.Spot, entry.Price) == MarketConditionDislocation {
+	// Require a spot_markup_pct setting for this account — no setting = no trade.
+	markupPct, ok := s.spotMarkupFor(ctx, req.AccountID)
+	if !ok {
+		return QuoteResponse{}, fmt.Errorf("no onramp fee settings configured for account %q", req.AccountID)
+	}
+
+	// adjusted_price = spot × (1 + spot_markup_pct/100).
+	// This is both the fee charged to the customer and the guard ceiling.
+	rawPrice := entry.Price
+	adjustedPrice := grid.Spot * (1 + markupPct/100)
+	feePct := markupPct / 100
+
+	// Guard: block if D0 exceeds the adjusted price (we'd be selling below cost).
+	if rawPrice > adjustedPrice {
+		s.log.Info("MARKET_DISLOCATION: D0 exceeds spot markup ceiling, blocking swap",
+			"account", req.AccountID,
+			"spot", grid.Spot,
+			"d0", rawPrice,
+			"spot_markup_pct", markupPct,
+			"ceiling", adjustedPrice,
+		)
 		return QuoteResponse{}, &ProviderError{Status: 422, Code: "MARKET_DISLOCATION"}
 	}
-
-	// Look up the per-account fee markup for BRL → USDT (0 when no row exists).
-	feePct := 0.0
-	if s.feeStore != nil && req.AccountID != "" {
-		if f, err := s.feeStore.GetFee(ctx, req.AccountID, "BRL", "USDT"); err != nil {
-			s.log.Warn("fee lookup failed (proceeding with 0%)", "account", req.AccountID, "err", err)
-		} else {
-			feePct = f
-		}
-	}
-
-	// Apply the markup: adjusted_price = raw_price * (1 + fee_pct).
-	// The user receives fewer USDT for the same BRL; the spread is our revenue.
-	rawPrice := entry.Price
-	adjustedPrice := rawPrice * (1 + feePct)
 
 	// BRL ÷ adjusted_price = USDT, rounded to 6 decimal places
 	usdtAmount := math.Round((req.BRLAmount/adjustedPrice)*1_000_000) / 1_000_000
@@ -569,34 +573,43 @@ type RatesResponse struct {
 	IndicativeAt    string  `json:"indicativeAt"`
 }
 
-// marketConditionFor evaluates whether the settlement price breaches the
-// account's configured max D0 premium over spot.
-// Returns MarketConditionNormal when:
-//   - no settings row exists for the account
-//   - spot is zero (can't compute a ratio)
-//   - settings lookup fails (fails open, logs a warning)
-//
-// Returns MarketConditionDislocation when price > spot × (1 + maxPremium/100).
-func (s *OnRampService) marketConditionFor(ctx context.Context, accountID string, spot, price float64) string {
-	if s.settingsStore == nil || accountID == "" || spot <= 0 {
-		return MarketConditionNormal
+// spotMarkupFor returns the spot_markup_pct for the account and a boolean
+// indicating whether a settings row was found.
+// On DB error it logs a warning and returns (0, false).
+func (s *OnRampService) spotMarkupFor(ctx context.Context, accountID string) (float64, bool) {
+	if s.settingsStore == nil || accountID == "" {
+		return 0, false
 	}
-	maxPremium, err := s.settingsStore.GetMaxD0PremiumPct(ctx, accountID)
+	settings, err := s.settingsStore.GetSettings(ctx, accountID)
 	if err != nil {
-		s.log.Warn("failed to load max_d0_premium_pct; treating as NORMAL", "account", accountID, "err", err)
+		if !errors.Is(err, store.ErrNoAccountSettings) {
+			s.log.Warn("failed to load onramp account settings", "account", accountID, "err", err)
+		}
+		return 0, false
+	}
+	return settings.SpotMarkupPct, true
+}
+
+// marketConditionFor evaluates whether the D0 price breaches the account's
+// spot markup threshold (adjusted_price = spot × (1 + spotMarkupPct/100)).
+// Returns MarketConditionNormal when spot is zero or no settings row exists.
+// Returns MarketConditionDislocation when d0Price > adjusted_price.
+func (s *OnRampService) marketConditionFor(ctx context.Context, accountID string, spot, d0Price float64) string {
+	if spot <= 0 {
 		return MarketConditionNormal
 	}
-	if maxPremium == nil {
+	markupPct, ok := s.spotMarkupFor(ctx, accountID)
+	if !ok {
 		return MarketConditionNormal
 	}
-	ceiling := spot * (1 + *maxPremium/100)
-	if price > ceiling {
-		s.log.Info("MARKET_DISLOCATION: D0 premium exceeds threshold",
+	adjustedPrice := spot * (1 + markupPct/100)
+	if d0Price > adjustedPrice {
+		s.log.Info("MARKET_DISLOCATION: D0 exceeds spot markup ceiling",
 			"account", accountID,
 			"spot", spot,
-			"price", price,
-			"max_premium_pct", *maxPremium,
-			"ceiling", ceiling,
+			"d0", d0Price,
+			"spot_markup_pct", markupPct,
+			"ceiling", adjustedPrice,
 		)
 		return MarketConditionDislocation
 	}

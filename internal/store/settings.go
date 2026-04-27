@@ -8,6 +8,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// ErrNoAccountSettings is returned when no settings row exists for an account.
+var ErrNoAccountSettings = errors.New("no onramp settings configured for account")
+
+// AccountSettings holds per-account on-ramp configuration.
+type AccountSettings struct {
+	AccountID     string
+	SpotMarkupPct float64 // e.g. 0.36 = 0.36 %
+	Description   string
+}
+
 // SettingsStore handles persistence for onramp_account_settings.
 type SettingsStore struct {
 	pool *pgxpool.Pool
@@ -18,35 +28,34 @@ func NewSettingsStore(pool *pgxpool.Pool) *SettingsStore {
 	return &SettingsStore{pool: pool}
 }
 
-// GetMaxD0PremiumPct returns the maximum allowed D0-over-spot premium for the
-// given account, expressed as a percentage (e.g. 0.036 = 0.036%).
-// Returns nil when no row exists (meaning no guard is applied).
-func (s *SettingsStore) GetMaxD0PremiumPct(ctx context.Context, accountID string) (*float64, error) {
+// GetSettings returns the settings for the given account.
+// Returns ErrNoAccountSettings when no row exists.
+func (s *SettingsStore) GetSettings(ctx context.Context, accountID string) (AccountSettings, error) {
 	const sql = `
-		SELECT max_d0_premium_pct
+		SELECT account_id, spot_markup_pct, COALESCE(description, '')
 		FROM onramp_account_settings
 		WHERE account_id = $1`
 
-	var pct *float64
-	err := s.pool.QueryRow(ctx, sql, accountID).Scan(&pct)
+	var as AccountSettings
+	err := s.pool.QueryRow(ctx, sql, accountID).Scan(&as.AccountID, &as.SpotMarkupPct, &as.Description)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
+			return AccountSettings{}, ErrNoAccountSettings
 		}
-		return nil, err
+		return AccountSettings{}, err
 	}
-	return pct, nil
+	return as, nil
 }
 
-// SetMaxD0PremiumPct upserts the max_d0_premium_pct for an account.
-// Pass nil to disable the guard.
-func (s *SettingsStore) SetMaxD0PremiumPct(ctx context.Context, accountID string, pct *float64) error {
+// SetSettings upserts the settings for an account.
+func (s *SettingsStore) SetSettings(ctx context.Context, as AccountSettings) error {
 	const sql = `
-		INSERT INTO onramp_account_settings (account_id, max_d0_premium_pct, updated_at)
-		VALUES ($1, $2, now())
+		INSERT INTO onramp_account_settings (account_id, spot_markup_pct, description, updated_at)
+		VALUES ($1, $2, $3, now())
 		ON CONFLICT (account_id) DO UPDATE
-		  SET max_d0_premium_pct = EXCLUDED.max_d0_premium_pct,
-		      updated_at         = now()`
-	_, err := s.pool.Exec(ctx, sql, accountID, pct)
+		  SET spot_markup_pct = EXCLUDED.spot_markup_pct,
+		      description     = EXCLUDED.description,
+		      updated_at      = now()`
+	_, err := s.pool.Exec(ctx, sql, as.AccountID, as.SpotMarkupPct, as.Description)
 	return err
 }

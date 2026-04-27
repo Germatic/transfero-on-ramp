@@ -88,11 +88,19 @@ CREATE INDEX IF NOT EXISTS onramp_fees_lookup
 --   NULL = no guard (all prices accepted).
 --   e.g. 0.036000 = 0.036%.
 -- -------------------------------------------------------
+-- onramp_account_settings: per-account markup applied over the spot price.
+-- spot_markup_pct is both the fee charged to the customer and the guard threshold:
+--   adjusted_price = spot × (1 + spot_markup_pct / 100)
+--   if D0 > adjusted_price → MARKET_DISLOCATION (trade blocked)
+-- Every account that uses the on-ramp MUST have a row here.
+-- i.e. 0.36 means zero point 36 percent (0.36 %)
 CREATE TABLE IF NOT EXISTS onramp_account_settings (
-  account_id           TEXT        PRIMARY KEY,
-  max_d0_premium_pct   NUMERIC(10,6),               -- NULL = disabled; i.e. 0.36 % is zero point 36 percent
-  description          TEXT,                        -- human-readable note, e.g. "BPN: max 0.36% D0 premium over spot"
-  updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+  account_id      TEXT        PRIMARY KEY,
+  spot_markup_pct NUMERIC(10,6) NOT NULL,  -- e.g. 0.360000 = 0.36 %
+  description     TEXT,
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS description     TEXT;
+ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS spot_markup_pct NUMERIC(10,6);
+ALTER TABLE onramp_account_settings DROP COLUMN IF EXISTS   max_d0_premium_pct;
 `
