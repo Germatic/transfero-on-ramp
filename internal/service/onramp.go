@@ -37,6 +37,8 @@ var (
 	ErrQuoteUsed           = store.ErrQuoteUsed
 	ErrNotFound            = store.ErrNotFound
 	ErrInsufficientBalance = errors.New("insufficient BRL balance")
+	ErrAccountRequired     = errors.New("account context required")
+	ErrNoOnRampSettings    = errors.New("no onramp settings configured for account")
 )
 
 // vendorRe matches any case-insensitive occurrence of the upstream vendor name.
@@ -567,11 +569,13 @@ const (
 )
 
 // RatesResponse is the response for GET /v1/rates.
+//
+// Price is the customer-facing all-in BRL/USDT rate (spot × (1 + spot_markup_pct/100)).
+// The raw upstream price and the markup percentage are deliberately not exposed.
 type RatesResponse struct {
 	FromCurrency    string  `json:"fromCurrency"`
 	ToCurrency      string  `json:"toCurrency"`
 	Price           float64 `json:"price"`
-	Spot            float64 `json:"spot"`
 	Settlement      string  `json:"settlement"`
 	MarketCondition string  `json:"marketCondition"` // "NORMAL" | "MARKET_DISLOCATION"
 	IndicativeAt    string  `json:"indicativeAt"`
@@ -620,17 +624,37 @@ func (s *OnRampService) marketConditionFor(ctx context.Context, accountID string
 	return MarketConditionNormal
 }
 
-// GetIndicativeRates returns the current indicative BRL→USDT price without locking a session.
-// It always returns price data; the MarketCondition field signals whether the
-// D0 premium is within the account's configured threshold.
+// GetIndicativeRates returns the current indicative BRL→USDT price without
+// locking a session.
+//
+// The price returned is the customer-facing all-in rate that matches what the
+// executor will charge at trade time:
+//
+//	price = spot × (1 + spot_markup_pct/100)
+//
+// The endpoint refuses (ErrAccountRequired / ErrNoOnRampSettings) when an
+// account context is missing or has no markup configured. This is symmetric
+// with CreateQuote, which also refuses without a settings row — if a caller
+// can't trade, they shouldn't see a rate either.
 func (s *OnRampService) GetIndicativeRates(ctx context.Context, accountID, settlement string) (RatesResponse, error) {
 	if settlement == "" {
 		settlement = "D0"
 	}
 
+	if accountID == "" {
+		return RatesResponse{}, ErrAccountRequired
+	}
+	markupPct, ok := s.spotMarkupFor(ctx, accountID)
+	if !ok {
+		return RatesResponse{}, ErrNoOnRampSettings
+	}
+
 	grid, err := s.transfero.GetPrices(ctx)
 	if err != nil {
 		return RatesResponse{}, s.wrapTransferoErr(err, "get prices")
+	}
+	if grid.Spot <= 0 {
+		return RatesResponse{}, fmt.Errorf("invalid spot price from upstream: %v", grid.Spot)
 	}
 
 	usdtPrices, ok := grid.Prices["USDT"]
@@ -650,13 +674,13 @@ func (s *OnRampService) GetIndicativeRates(ctx context.Context, accountID, settl
 		return RatesResponse{}, fmt.Errorf("invalid settlement %q", settlement)
 	}
 
+	displayPrice := grid.Spot * (1 + markupPct/100)
 	condition := s.marketConditionFor(ctx, accountID, grid.Spot, entry.Price)
 
 	return RatesResponse{
 		FromCurrency:    "BRL",
 		ToCurrency:      "USDT",
-		Price:           entry.Price,
-		Spot:            grid.Spot,
+		Price:           displayPrice,
 		Settlement:      settlement,
 		MarketCondition: condition,
 		IndicativeAt:    time.Now().UTC().Format(time.RFC3339),

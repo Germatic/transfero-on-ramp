@@ -297,6 +297,10 @@ func mapServiceErr(err error) (int, string) {
 		return http.StatusNotFound, "not found"
 	case errors.Is(err, service.ErrInsufficientBalance):
 		return http.StatusPaymentRequired, "insufficient BRL balance"
+	case errors.Is(err, service.ErrAccountRequired):
+		return http.StatusUnauthorized, "account context required"
+	case errors.Is(err, service.ErrNoOnRampSettings):
+		return http.StatusForbidden, "no onramp settings configured for account"
 	default:
 		return http.StatusInternalServerError, "internal error"
 	}
