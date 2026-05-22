@@ -2,17 +2,18 @@
 //
 // The two main operations are:
 //
-//   CreateQuote  — fetches the live BRL/USDT price from Transfero, locks it by
-//                  creating a Transfero session, and persists the quote.
+//	CreateQuote  — fetches the live BRL/USDT price from Transfero, locks it by
+//	               creating a Transfero session, and persists the quote.
 //
-//   ConfirmOrder — validates the quote is still open, debits BRL from dinacore,
-//                  closes the Transfero session (confirming the trade), credits
-//                  USDT to dinacore, and persists the order.
+//	ConfirmOrder — validates the quote is still open, debits BRL from dinacore,
+//	               closes the Transfero session (confirming the trade), credits
+//	               USDT to dinacore, and persists the order.
 //
 // Failure handling for ConfirmOrder:
-//   If CloseSession fails after BRL is already debited, the service checks
-//   GET /v1/closings for an entry matching the quoteId (oid). If found, the
-//   trade happened and USDT is credited. If not found, BRL is refunded.
+//
+//	If CloseSession fails after BRL is already debited, the service checks
+//	GET /v1/closings for an entry matching the quoteId (oid). If found, the
+//	trade happened and USDT is credited. If not found, BRL is refunded.
 package service
 
 import (
@@ -83,10 +84,10 @@ type QuoteResponse struct {
 
 // OrderRequest is the validated input for ConfirmOrder.
 type OrderRequest struct {
-	AccountID          string  // resolved from Bearer token
+	AccountID          string // resolved from Bearer token
 	QuoteID            string
-	DestinationAddress string  // TRC20 wallet where Transfero delivers USDT
-	PayoutID           string  // dinapay payout row ID — stored so reconciler can mark it completed
+	DestinationAddress string // TRC20 wallet where Transfero delivers USDT
+	PayoutID           string // dinapay payout row ID — stored so reconciler can mark it completed
 	// RequestedBRL is the original merchant-facing BRL amount (before any spread).
 	// When set (ExecuteSettlement path), Dinacore is debited for this amount so that
 	// it stays in sync with Dinapay's merchants.balance. When zero (direct API call),
@@ -96,21 +97,21 @@ type OrderRequest struct {
 
 // OrderResponse is returned after a trade is confirmed.
 type OrderResponse struct {
-	OrderID             string  `json:"orderId"`
-	QuoteID             string  `json:"quoteId"`
-	ClosingID           string  `json:"closingId"`
-	OID                 string  `json:"oid"`
-	USDTAmount          float64 `json:"usdtAmount"`
-	BRLAmount           float64 `json:"brlAmount"`
-	Price               float64 `json:"price"`              // BRL per USDT (after fee markup)
-	RawPrice            float64 `json:"rawPrice,omitempty"` // Transfero's original price (omitted when fee=0)
-	FeePct              float64 `json:"feePct,omitempty"`   // markup applied, e.g. 0.002 = 0.2%
-	Settlement          string  `json:"settlement"`
-	DestinationAddress  string  `json:"destinationAddress"`
-	Network             string  `json:"network"`
-	Status              string  `json:"status"`
-	PixPaymentGroupID   string  `json:"pixPaymentGroupId,omitempty"`
-	CreatedAt           string  `json:"createdAt"`
+	OrderID            string  `json:"orderId"`
+	QuoteID            string  `json:"quoteId"`
+	ClosingID          string  `json:"closingId"`
+	OID                string  `json:"oid"`
+	USDTAmount         float64 `json:"usdtAmount"`
+	BRLAmount          float64 `json:"brlAmount"`
+	Price              float64 `json:"price"`              // BRL per USDT (after fee markup)
+	RawPrice           float64 `json:"rawPrice,omitempty"` // Transfero's original price (omitted when fee=0)
+	FeePct             float64 `json:"feePct,omitempty"`   // markup applied, e.g. 0.002 = 0.2%
+	Settlement         string  `json:"settlement"`
+	DestinationAddress string  `json:"destinationAddress"`
+	Network            string  `json:"network"`
+	Status             string  `json:"status"`
+	PixPaymentGroupID  string  `json:"pixPaymentGroupId,omitempty"`
+	CreatedAt          string  `json:"createdAt"`
 }
 
 // OrderListResponse is the payload for the list endpoint.
@@ -133,10 +134,10 @@ type PaginationMeta struct {
 
 // OTCDeskConfig holds the parameters for sending BRL to the Transfero OTC desk.
 type OTCDeskConfig struct {
-	BaasClient    *transfero.BaasClient
-	AccountID     string // source account (collector, e.g. "2133")
-	PIXKey        string // OTC desk PIX key
-	TaxID         string // Transfero CNPJ (optional)
+	BaasClient *transfero.BaasClient
+	AccountID  string // source account (collector, e.g. "2133")
+	PIXKey     string // OTC desk PIX key
+	TaxID      string // Transfero CNPJ (optional)
 }
 
 // OnRampService orchestrates quote creation and order confirmation.
@@ -183,12 +184,25 @@ func (s *OnRampService) WithOTCDesk(cfg OTCDeskConfig) *OnRampService {
 // CreateQuote
 // ─────────────────────────────────────────────────────────────────────────────
 
-// CreateQuote fetches the live price from Transfero, calculates the USDT amount
-// the customer receives for their BRL, locks the price by creating a Transfero
-// session, and persists the quote record.
+// CreateQuote prices and locks a BRL→USDT swap using Variant C of the OTC flow:
 //
-// The quote is valid for the session TTL configured on Transfero (~7 seconds).
-// The customer must call ConfirmOrder before ExpiresAt.
+//  1. Open a discovery session in BRL (POST /v1/sessions { amount_brl }) to read
+//     Transfero's locked spot and D0 — the values that will appear on the closing
+//     statement. We never close this session; it expires in ~7s.
+//  2. Anchor the customer markup on the discovered spot:
+//     adjusted_price = discovery.spot × (1 + spot_markup_pct/100).
+//  3. Guard MARKET_DISLOCATION when D0 exceeds the customer's ceiling.
+//  4. Open the real lock session in USDT (POST /v1/sessions { amount }) sized
+//     so the customer pays req.BRLAmount at the markup rate.
+//  5. Persist the quote against the real lock session.
+//
+// The quote is valid for the lock session's TTL (~7s); the customer must call
+// ConfirmOrder before ExpiresAt.
+//
+// Rationale: GET /v1/prices is a published-snapshot feed that goes stale during
+// off-hours; only POST /v1/sessions exposes the spot Transfero will actually
+// lock against. Anchoring on the discovered locked spot keeps the "X bps over
+// Transfero spot" rule honest 24/7.
 func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (QuoteResponse, error) {
 	if req.Settlement == "" {
 		req.Settlement = "D0"
@@ -196,61 +210,16 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 	if req.Network == "" {
 		req.Network = "mainnet"
 	}
-
-	// Fetch the live price grid
-	grid, err := s.transfero.GetPrices(ctx)
-	if err != nil {
-		return QuoteResponse{}, s.wrapTransferoErr(err, "get prices")
-	}
-
-	usdtPrices, ok := grid.Prices["USDT"]
-	if !ok {
-		return QuoteResponse{}, fmt.Errorf("USDT prices not available from Transfero")
-	}
-
-	var entry transfero.PriceEntry
-	switch req.Settlement {
-	case "D0":
-		entry = usdtPrices.D0
-	case "D1":
-		entry = usdtPrices.D1
-	case "D2":
-		entry = usdtPrices.D2
-	default:
+	if req.Settlement != "D0" && req.Settlement != "D1" && req.Settlement != "D2" {
 		return QuoteResponse{}, fmt.Errorf("invalid settlement %q: must be D0, D1 or D2", req.Settlement)
 	}
-	if entry.Price <= 0 {
-		return QuoteResponse{}, fmt.Errorf("invalid price from Transfero: %v", entry.Price)
-	}
 
-	// Require a spot_markup_pct setting for this account — no setting = no trade.
 	markupPct, ok := s.spotMarkupFor(ctx, req.AccountID)
 	if !ok {
 		return QuoteResponse{}, fmt.Errorf("no onramp fee settings configured for account %q", req.AccountID)
 	}
-
-	// adjusted_price = spot × (1 + spot_markup_pct/100).
-	// This is both the fee charged to the customer and the guard ceiling.
-	rawPrice := entry.Price
-	adjustedPrice := grid.Spot * (1 + markupPct/100)
 	feePct := markupPct / 100
 
-	// Guard: block if D0 exceeds the adjusted price (we'd be selling below cost).
-	if rawPrice > adjustedPrice {
-		s.log.Info("MARKET_DISLOCATION: D0 exceeds spot markup ceiling, blocking swap",
-			"account", req.AccountID,
-			"spot", grid.Spot,
-			"d0", rawPrice,
-			"spot_markup_pct", markupPct,
-			"ceiling", adjustedPrice,
-		)
-		return QuoteResponse{}, &ProviderError{Status: 422, Code: "MARKET_DISLOCATION"}
-	}
-
-	// BRL ÷ adjusted_price = USDT, rounded to 6 decimal places
-	usdtAmount := math.Round((req.BRLAmount/adjustedPrice)*1_000_000) / 1_000_000
-
-	// Check that the account has enough BRL balance before locking the price
 	if s.dinacore != nil && req.AccountID != "" {
 		balance, err := s.dinacore.GetBalance(ctx, req.AccountID, "BRL")
 		if err != nil {
@@ -260,11 +229,59 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		}
 	}
 
-	// Lock the price by creating a Transfero session (wallet provided at close time)
+	discovery, err := s.transfero.CreateSessionByBRL(ctx, req.BRLAmount, req.Settlement)
+	if err != nil {
+		return QuoteResponse{}, s.wrapTransferoErr(err, "discovery session")
+	}
+	if discovery.Spot <= 0 || discovery.Price <= 0 {
+		return QuoteResponse{}, fmt.Errorf("invalid discovery session: spot=%v price=%v", discovery.Spot, discovery.Price)
+	}
+
+	rawPrice := discovery.Price
+	adjustedPrice := discovery.Spot * (1 + markupPct/100)
+
+	if rawPrice > adjustedPrice {
+		s.log.Info("MARKET_DISLOCATION: D0 exceeds spot markup ceiling, blocking swap",
+			"account", req.AccountID,
+			"discoverySessionId", discovery.SessionID,
+			"spot", discovery.Spot,
+			"d0", rawPrice,
+			"spot_markup_pct", markupPct,
+			"ceiling", adjustedPrice,
+		)
+		return QuoteResponse{}, &ProviderError{Status: 422, Code: "MARKET_DISLOCATION"}
+	}
+
+	// Transfero quantises USDT to 2 decimals. We round UP so the customer's
+	// effective rate (req.BRLAmount / deliveredUSDT) is always ≤ adjustedPrice
+	// — i.e. markup ≤ spot_markup_pct. The sub-cent of extra USDT comes out of
+	// our margin (max ~one USDT cent × lockD0 ≈ 0.05 BRL per swap).
+	usdtAmount := math.Ceil((req.BRLAmount/adjustedPrice)*100) / 100
+	if usdtAmount <= 0 {
+		return QuoteResponse{}, fmt.Errorf("computed USDT amount is zero (brl=%v price=%v)", req.BRLAmount, adjustedPrice)
+	}
+
 	sess, err := s.transfero.CreateSession(ctx, usdtAmount, req.Settlement)
 	if err != nil {
 		return QuoteResponse{}, s.wrapTransferoErr(err, "create session")
 	}
+
+	// Audit: capture both locked spots so off-hours / drift incidents are diagnosable from logs.
+	s.log.Info("onramp.quote.locked",
+		"account", req.AccountID,
+		"settlement", req.Settlement,
+		"customerBRL", req.BRLAmount,
+		"discoverySessionId", discovery.SessionID,
+		"discoverySpot", discovery.Spot,
+		"discoveryD0", discovery.Price,
+		"lockSessionId", sess.SessionID,
+		"lockSpot", sess.Spot,
+		"lockD0", sess.Price,
+		"lockUSDT", sess.Amount,
+		"lockTotalBRL", sess.TotalBRL,
+		"customerPrice", adjustedPrice,
+		"spot_markup_pct", markupPct,
+	)
 
 	expiresAt, err := time.Parse(time.RFC3339, sess.ExpiresAt)
 	if err != nil {
@@ -392,20 +409,20 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 				"brlAmount", closing.TotalBRL, "otcPixKey", s.otcDesk.PIXKey, "err", pixErr)
 			// Persist so operators can see it and retry
 			_ = s.quoteStore.MarkUsed(ctx, req.QuoteID)
-		orderID, _ := s.orderStore.Insert(ctx, store.Order{
-			AccountID:          req.AccountID,
-			QuoteID:            req.QuoteID,
-			TransferoClosingID: closing.ClosingID,
-			OID:                req.QuoteID,
-			BRLAmount:          closing.TotalBRL,
-			USDTAmount:         closing.Amount,
-			Price:              closing.Price,
-			Settlement:         closing.Settlement,
-			DestinationAddress: req.DestinationAddress,
-			Network:            quote.Network,
-			Status:             "payment_failed",
-			PayoutID:           req.PayoutID,
-		})
+			orderID, _ := s.orderStore.Insert(ctx, store.Order{
+				AccountID:          req.AccountID,
+				QuoteID:            req.QuoteID,
+				TransferoClosingID: closing.ClosingID,
+				OID:                req.QuoteID,
+				BRLAmount:          closing.TotalBRL,
+				USDTAmount:         closing.Amount,
+				Price:              closing.Price,
+				Settlement:         closing.Settlement,
+				DestinationAddress: req.DestinationAddress,
+				Network:            quote.Network,
+				Status:             "payment_failed",
+				PayoutID:           req.PayoutID,
+			})
 			_ = orderID
 			return OrderResponse{}, fmt.Errorf("send BRL to OTC desk: %w", pixErr)
 		}
@@ -489,7 +506,7 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 
 // ExecuteRequest is the input for ExecuteSettlement.
 type ExecuteRequest struct {
-	PayoutID   string  // dinapay payout ID (for logging / idempotency tracking)
+	PayoutID   string // dinapay payout ID (for logging / idempotency tracking)
 	AccountID  string
 	BRLAmount  float64
 	Address    string
@@ -539,7 +556,7 @@ func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteReques
 		AccountID:          req.AccountID,
 		QuoteID:            quote.QuoteID,
 		DestinationAddress: req.Address,
-		PayoutID:           req.PayoutID, // stored in onramp_orders so reconciler can complete the payout
+		PayoutID:           req.PayoutID,  // stored in onramp_orders so reconciler can complete the payout
 		RequestedBRL:       req.BRLAmount, // full merchant amount; keeps Dinacore in sync with Dinapay
 	})
 	if err != nil {

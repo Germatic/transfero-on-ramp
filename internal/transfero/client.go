@@ -1,16 +1,18 @@
 // Package transfero provides a client for the Transfero OTC API.
 //
 // Authentication flow:
-//   POST /v1/auth/login  →  short-lived JWT
+//
+//	POST /v1/auth/login  →  short-lived JWT
 //
 // The JWT is cached in memory and automatically refreshed when it is within
 // 60 seconds of expiry, so callers never need to manage tokens manually.
 //
 // Trading flow:
-//   GET  /v1/prices           → live price grid (BRL per USDT/USDC, D0/D1/D2)
-//   POST /v1/sessions         → lock a price for ~7 seconds
-//   POST /v1/sessions/:id/close → confirm the trade (idempotent via oid)
-//   GET  /v1/closings         → confirmed trade history
+//
+//	GET  /v1/prices           → live price grid (BRL per USDT/USDC, D0/D1/D2)
+//	POST /v1/sessions         → lock a price for ~7 seconds
+//	POST /v1/sessions/:id/close → confirm the trade (idempotent via oid)
+//	GET  /v1/closings         → confirmed trade history
 package transfero
 
 import (
@@ -54,8 +56,8 @@ type Session struct {
 	SessionID  string  `json:"session_id"`
 	Currency   string  `json:"currency"`
 	Settlement string  `json:"settlement"`
-	Amount     float64 `json:"amount"`    // USD amount
-	Price      float64 `json:"price"`     // BRL per USD at lock time
+	Amount     float64 `json:"amount"` // USD amount
+	Price      float64 `json:"price"`  // BRL per USD at lock time
 	Spot       float64 `json:"spot"`
 	SpreadPct  float64 `json:"spread_pct"`
 	TotalBRL   float64 `json:"total_brl"` // = amount × price
@@ -212,6 +214,33 @@ func (c *Client) CreateSession(ctx context.Context, usdtAmount float64, settleme
 	var sess Session
 	if err := c.do(ctx, "POST", "/v1/sessions", &tok, body, &sess); err != nil {
 		return nil, fmt.Errorf("transfero create session: %w", err)
+	}
+	return &sess, nil
+}
+
+// CreateSessionByBRL is identical to CreateSession but sizes the trade by BRL
+// rather than USDT. Transfero quantises the resulting USDT amount to 2 decimals
+// and reports the actual BRL cost in the response's total_brl field.
+//
+// Primary use case is price discovery: open one session with the customer's BRL
+// to read the locked spot, compute the customer markup, then open a second
+// session sized in USDT to lock that exact trade. The first session is left
+// to expire (Transfero has no cancel endpoint; sessions age out after the TTL).
+func (c *Client) CreateSessionByBRL(ctx context.Context, brlAmount float64, settlement string) (*Session, error) {
+	tok, err := c.bearerToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	body := map[string]any{
+		"currency":   "USDT",
+		"settlement": settlement,
+		"amount_brl": brlAmount,
+	}
+
+	var sess Session
+	if err := c.do(ctx, "POST", "/v1/sessions", &tok, body, &sess); err != nil {
+		return nil, fmt.Errorf("transfero create session (brl): %w", err)
 	}
 	return &sess, nil
 }
