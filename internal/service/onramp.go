@@ -71,15 +71,16 @@ type QuoteRequest struct {
 
 // QuoteResponse is returned to the customer after a price is locked.
 type QuoteResponse struct {
-	QuoteID    string  `json:"quoteId"`
-	USDTAmount float64 `json:"usdtAmount"`
-	BRLAmount  float64 `json:"brlAmount"`
-	Price      float64 `json:"price"`              // BRL per USDT (after fee markup)
-	RawPrice   float64 `json:"rawPrice,omitempty"` // Transfero's original price (omitted when fee=0)
-	FeePct     float64 `json:"feePct,omitempty"`   // markup applied, e.g. 0.002 = 0.2%
-	Settlement string  `json:"settlement"`
-	Network    string  `json:"network"`
-	ExpiresAt  string  `json:"expiresAt"` // RFC3339
+	QuoteID     string  `json:"quoteId"`
+	USDTAmount  float64 `json:"usdtAmount"`
+	BRLAmount   float64 `json:"brlAmount"`
+	Price       float64 `json:"price"`                 // BRL per USDT (customer-facing, two-regime)
+	RawPrice    float64 `json:"rawPrice,omitempty"`    // Transfero's D0 (omitted when fee=0)
+	FeePct      float64 `json:"feePct,omitempty"`      // effective markup over anchor in the active regime
+	PriceRegime string  `json:"priceRegime,omitempty"` // "spot_anchor" | "d0_anchor"
+	Settlement  string  `json:"settlement"`
+	Network     string  `json:"network"`
+	ExpiresAt   string  `json:"expiresAt"` // RFC3339
 }
 
 // OrderRequest is the validated input for ConfirmOrder.
@@ -103,9 +104,9 @@ type OrderResponse struct {
 	OID                string  `json:"oid"`
 	USDTAmount         float64 `json:"usdtAmount"`
 	BRLAmount          float64 `json:"brlAmount"`
-	Price              float64 `json:"price"`              // BRL per USDT (after fee markup)
-	RawPrice           float64 `json:"rawPrice,omitempty"` // Transfero's original price (omitted when fee=0)
-	FeePct             float64 `json:"feePct,omitempty"`   // markup applied, e.g. 0.002 = 0.2%
+	Price              float64 `json:"price"`              // BRL per USDT (customer-facing, two-regime)
+	RawPrice           float64 `json:"rawPrice,omitempty"` // Transfero's D0 (omitted when fee=0)
+	FeePct             float64 `json:"feePct,omitempty"`   // effective markup over anchor
 	Settlement         string  `json:"settlement"`
 	DestinationAddress string  `json:"destinationAddress"`
 	Network            string  `json:"network"`
@@ -184,25 +185,26 @@ func (s *OnRampService) WithOTCDesk(cfg OTCDeskConfig) *OnRampService {
 // CreateQuote
 // ─────────────────────────────────────────────────────────────────────────────
 
-// CreateQuote prices and locks a BRL→USDT swap using Variant C of the OTC flow:
+// CreateQuote prices and locks a BRL→USDT swap:
 //
-//  1. Open a discovery session in BRL (POST /v1/sessions { amount_brl }) to read
-//     Transfero's locked spot and D0 — the values that will appear on the closing
-//     statement. We never close this session; it expires in ~7s.
-//  2. Anchor the customer markup on the discovered spot:
-//     adjusted_price = discovery.spot × (1 + spot_markup_pct/100).
-//  3. Guard MARKET_DISLOCATION when D0 exceeds the customer's ceiling.
-//  4. Open the real lock session in USDT (POST /v1/sessions { amount }) sized
-//     so the customer pays req.BRLAmount at the markup rate.
-//  5. Persist the quote against the real lock session.
+//  1. Open a discovery session in BRL (POST /v1/sessions { amount_brl }) to
+//     read the live Spot and D0 Transfero would lock against. We never close
+//     this session; it expires server-side in ~7s.
+//  2. Apply the two-regime pricing rule (see computeCustomerPrice) to derive
+//     the customer-facing price. Every quote executes; there is no
+//     MARKET_DISLOCATION rejection.
+//  3. Open the real lock session in USDT, sized so the customer pays
+//     req.BRLAmount at the derived rate (math.Ceil USDT for the ≤-markup
+//     invariant in the spot_anchor branch).
+//  4. Persist the quote against the lock session.
 //
 // The quote is valid for the lock session's TTL (~7s); the customer must call
 // ConfirmOrder before ExpiresAt.
 //
-// Rationale: GET /v1/prices is a published-snapshot feed that goes stale during
-// off-hours; only POST /v1/sessions exposes the spot Transfero will actually
-// lock against. Anchoring on the discovered locked spot keeps the "X bps over
-// Transfero spot" rule honest 24/7.
+// Rationale: GET /v1/prices is a published-snapshot feed that goes stale
+// during off-hours; only POST /v1/sessions exposes the Spot/D0 Transfero
+// will actually lock against. Anchoring on those values keeps both branches
+// of the two-regime rule honest 24/7.
 func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (QuoteResponse, error) {
 	if req.Settlement == "" {
 		req.Settlement = "D0"
@@ -214,11 +216,10 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		return QuoteResponse{}, fmt.Errorf("invalid settlement %q: must be D0, D1 or D2", req.Settlement)
 	}
 
-	markupPct, ok := s.spotMarkupFor(ctx, req.AccountID)
+	params, ok := s.pricingFor(ctx, req.AccountID)
 	if !ok {
 		return QuoteResponse{}, fmt.Errorf("no onramp fee settings configured for account %q", req.AccountID)
 	}
-	feePct := markupPct / 100
 
 	if s.dinacore != nil && req.AccountID != "" {
 		balance, err := s.dinacore.GetBalance(ctx, req.AccountID, "BRL")
@@ -238,27 +239,17 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 	}
 
 	rawPrice := discovery.Price
-	adjustedPrice := discovery.Spot * (1 + markupPct/100)
-
-	if rawPrice > adjustedPrice {
-		s.log.Info("MARKET_DISLOCATION: D0 exceeds spot markup ceiling, blocking swap",
-			"account", req.AccountID,
-			"discoverySessionId", discovery.SessionID,
-			"spot", discovery.Spot,
-			"d0", rawPrice,
-			"spot_markup_pct", markupPct,
-			"ceiling", adjustedPrice,
-		)
-		return QuoteResponse{}, &ProviderError{Status: 422, Code: "MARKET_DISLOCATION"}
-	}
+	customerPrice, regime := computeCustomerPrice(discovery.Spot, discovery.Price, params)
+	feePct := effectiveMarkupPct(regime, params) / 100
 
 	// Transfero quantises USDT to 2 decimals. We round UP so the customer's
-	// effective rate (req.BRLAmount / deliveredUSDT) is always ≤ adjustedPrice
-	// — i.e. markup ≤ spot_markup_pct. The sub-cent of extra USDT comes out of
-	// our margin (max ~one USDT cent × lockD0 ≈ 0.05 BRL per swap).
-	usdtAmount := math.Ceil((req.BRLAmount/adjustedPrice)*100) / 100
+	// effective rate (req.BRLAmount / deliveredUSDT) never exceeds customerPrice
+	// — i.e. markup stays at or below the active regime's anchor. The sub-cent
+	// of extra USDT comes out of our margin (max ~one USDT cent × D0 ≈ 0.05
+	// BRL per swap).
+	usdtAmount := math.Ceil((req.BRLAmount/customerPrice)*100) / 100
 	if usdtAmount <= 0 {
-		return QuoteResponse{}, fmt.Errorf("computed USDT amount is zero (brl=%v price=%v)", req.BRLAmount, adjustedPrice)
+		return QuoteResponse{}, fmt.Errorf("computed USDT amount is zero (brl=%v price=%v)", req.BRLAmount, customerPrice)
 	}
 
 	sess, err := s.transfero.CreateSession(ctx, usdtAmount, req.Settlement)
@@ -266,7 +257,8 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		return QuoteResponse{}, s.wrapTransferoErr(err, "create session")
 	}
 
-	// Audit: capture both locked spots so off-hours / drift incidents are diagnosable from logs.
+	// Audit: discovery + lock Spot/D0 and regime tag, so any off-hours / drift
+	// incident is fully diagnosable from pm2 logs alone.
 	s.log.Info("onramp.quote.locked",
 		"account", req.AccountID,
 		"settlement", req.Settlement,
@@ -274,13 +266,17 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		"discoverySessionId", discovery.SessionID,
 		"discoverySpot", discovery.Spot,
 		"discoveryD0", discovery.Price,
+		"basisD0OverSpot", discovery.Price/discovery.Spot,
+		"regime", regime,
 		"lockSessionId", sess.SessionID,
 		"lockSpot", sess.Spot,
 		"lockD0", sess.Price,
 		"lockUSDT", sess.Amount,
 		"lockTotalBRL", sess.TotalBRL,
-		"customerPrice", adjustedPrice,
-		"spot_markup_pct", markupPct,
+		"customerPrice", customerPrice,
+		"spot_markup_pct", params.SpotMarkupPct,
+		"d0_markup_pct", params.D0MarkupPct,
+		"basis_threshold_pct", params.BasisThresholdPct,
 	)
 
 	expiresAt, err := time.Parse(time.RFC3339, sess.ExpiresAt)
@@ -293,7 +289,7 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		TransferoSessionID: sess.SessionID,
 		BRLAmount:          sess.TotalBRL,
 		USDTAmount:         sess.Amount,
-		Price:              adjustedPrice,
+		Price:              customerPrice,
 		RawPrice:           rawPrice,
 		FeePct:             feePct,
 		Settlement:         sess.Settlement,
@@ -305,13 +301,14 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 	}
 
 	resp := QuoteResponse{
-		QuoteID:    quoteID,
-		USDTAmount: sess.Amount,
-		BRLAmount:  sess.TotalBRL,
-		Price:      adjustedPrice,
-		Settlement: sess.Settlement,
-		Network:    req.Network,
-		ExpiresAt:  expiresAt.Format(time.RFC3339),
+		QuoteID:     quoteID,
+		USDTAmount:  sess.Amount,
+		BRLAmount:   sess.TotalBRL,
+		Price:       customerPrice,
+		PriceRegime: regime,
+		Settlement:  sess.Settlement,
+		Network:     req.Network,
+		ExpiresAt:   expiresAt.Format(time.RFC3339),
 	}
 	if feePct > 0 {
 		resp.RawPrice = rawPrice
@@ -575,132 +572,161 @@ func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteReques
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Indicative rates
+// Pricing — two-regime BRL→USDT rule
 // ─────────────────────────────────────────────────────────────────────────────
 
-// MarketConditionNormal and MarketConditionDislocation are the two possible
-// values for the MarketCondition field in RatesResponse.
+// PriceRegime constants identify which branch of the two-regime rule produced
+// a given customer price.
 const (
-	MarketConditionNormal      = "NORMAL"
-	MarketConditionDislocation = "MARKET_DISLOCATION"
+	PriceRegimeSpotAnchor = "spot_anchor" // basis ≤ threshold; customer = Spot × (1 + SpotMarkupPct/100)
+	PriceRegimeD0Anchor   = "d0_anchor"   // basis  > threshold; customer = D0   × (1 + D0MarkupPct/100)
 )
 
-// RatesResponse is the response for GET /v1/rates.
-//
-// Price is the customer-facing all-in BRL/USDT rate (spot × (1 + spot_markup_pct/100)).
-// The raw upstream price and the markup percentage are deliberately not exposed.
-type RatesResponse struct {
-	FromCurrency    string  `json:"fromCurrency"`
-	ToCurrency      string  `json:"toCurrency"`
-	Price           float64 `json:"price"`
-	Settlement      string  `json:"settlement"`
-	MarketCondition string  `json:"marketCondition"` // "NORMAL" | "MARKET_DISLOCATION"
-	IndicativeAt    string  `json:"indicativeAt"`
+// PricingParams are the per-account pricing knobs read from
+// onramp_account_settings. See computeCustomerPrice for the rule.
+type PricingParams struct {
+	SpotMarkupPct     float64 // low-basis regime markup over Spot
+	D0MarkupPct       float64 // high-basis regime markup over D0
+	BasisThresholdPct float64 // regime cutover at D0/Spot
 }
 
-// spotMarkupFor returns the spot_markup_pct for the account and a boolean
-// indicating whether a settings row was found.
-// On DB error it logs a warning and returns (0, false).
-func (s *OnRampService) spotMarkupFor(ctx context.Context, accountID string) (float64, bool) {
+// IndicativeRatesAmount is the BRL amount used to open a discovery session
+// when GET /v1/rates is called without an explicit ?amount=. It's large enough
+// to clear Transfero's minimum-ticket validation but small enough not to be
+// wasteful. The value is indicative only — Transfero quotes the same Spot/D0
+// pair within a wide amount range during normal liquidity.
+const IndicativeRatesAmount = 100.0
+
+// computeCustomerPrice applies the two-regime BRL→USDT rule:
+//
+//	basis = d0 / spot
+//	if basis ≤ 1 + p.BasisThresholdPct/100   → spot × (1 + p.SpotMarkupPct/100), spot_anchor
+//	else                                     → d0   × (1 + p.D0MarkupPct/100),   d0_anchor
+//
+// Returns the customer price (BRL per USDT) and the active regime tag. Pure;
+// no IO, no logging.
+func computeCustomerPrice(spot, d0 float64, p PricingParams) (price float64, regime string) {
+	threshold := 1 + p.BasisThresholdPct/100
+	if d0/spot <= threshold {
+		return spot * (1 + p.SpotMarkupPct/100), PriceRegimeSpotAnchor
+	}
+	return d0 * (1 + p.D0MarkupPct/100), PriceRegimeD0Anchor
+}
+
+// effectiveMarkupPct returns the markup percentage of the active regime
+// (i.e. what to put in the FeePct field of the response).
+func effectiveMarkupPct(regime string, p PricingParams) float64 {
+	if regime == PriceRegimeD0Anchor {
+		return p.D0MarkupPct
+	}
+	return p.SpotMarkupPct
+}
+
+// pricingFor returns the PricingParams for the account and a boolean
+// indicating whether a settings row was found. On DB error it logs a warning
+// and returns (zero, false).
+func (s *OnRampService) pricingFor(ctx context.Context, accountID string) (PricingParams, bool) {
 	if s.settingsStore == nil || accountID == "" {
-		return 0, false
+		return PricingParams{}, false
 	}
 	settings, err := s.settingsStore.GetSettings(ctx, accountID)
 	if err != nil {
 		if !errors.Is(err, store.ErrNoAccountSettings) {
 			s.log.Warn("failed to load onramp account settings", "account", accountID, "err", err)
 		}
-		return 0, false
+		return PricingParams{}, false
 	}
-	return settings.SpotMarkupPct, true
+	return PricingParams{
+		SpotMarkupPct:     settings.SpotMarkupPct,
+		D0MarkupPct:       settings.D0MarkupPct,
+		BasisThresholdPct: settings.BasisThresholdPct,
+	}, true
 }
 
-// marketConditionFor evaluates whether the D0 price breaches the account's
-// spot markup threshold (adjusted_price = spot × (1 + spotMarkupPct/100)).
-// Returns MarketConditionNormal when spot is zero or no settings row exists.
-// Returns MarketConditionDislocation when d0Price > adjusted_price.
-func (s *OnRampService) marketConditionFor(ctx context.Context, accountID string, spot, d0Price float64) string {
-	if spot <= 0 {
-		return MarketConditionNormal
-	}
-	markupPct, ok := s.spotMarkupFor(ctx, accountID)
-	if !ok {
-		return MarketConditionNormal
-	}
-	adjustedPrice := spot * (1 + markupPct/100)
-	if d0Price > adjustedPrice {
-		s.log.Info("MARKET_DISLOCATION: D0 exceeds spot markup ceiling",
-			"account", accountID,
-			"spot", spot,
-			"d0", d0Price,
-			"spot_markup_pct", markupPct,
-			"ceiling", adjustedPrice,
-		)
-		return MarketConditionDislocation
-	}
-	return MarketConditionNormal
+// ─────────────────────────────────────────────────────────────────────────────
+// Indicative rates
+// ─────────────────────────────────────────────────────────────────────────────
+
+// RatesResponse is the response for GET /v1/rates.
+//
+// Price is the customer-facing all-in BRL/USDT rate derived from the same
+// live Transfero session the executor would lock, then run through the
+// two-regime rule. PriceRegime reports which branch of the rule fired.
+type RatesResponse struct {
+	FromCurrency string  `json:"fromCurrency"`
+	ToCurrency   string  `json:"toCurrency"`
+	Price        float64 `json:"price"`
+	RawPrice     float64 `json:"rawPrice,omitempty"`    // Transfero's D0
+	PriceRegime  string  `json:"priceRegime,omitempty"` // "spot_anchor" | "d0_anchor"
+	Settlement   string  `json:"settlement"`
+	IndicativeAt string  `json:"indicativeAt"`
 }
 
-// GetIndicativeRates returns the current indicative BRL→USDT price without
-// locking a session.
+// GetIndicativeRates returns the current indicative BRL→USDT price by opening
+// a transient discovery session against Transfero's live FX engine and
+// applying the same two-regime rule used by CreateQuote.
 //
-// The price returned is the customer-facing all-in rate that matches what the
-// executor will charge at trade time:
-//
-//	price = spot × (1 + spot_markup_pct/100)
+// Unlike the published-snapshot price feed (which is stale by minutes
+// off-hours), the discovery session returns the spot and D0 Transfero would
+// actually lock right now. The session is sized by amountBRL (default
+// IndicativeRatesAmount when zero) and never closed; Transfero expires it
+// server-side after ~7s.
 //
 // The endpoint refuses (ErrAccountRequired / ErrNoOnRampSettings) when an
-// account context is missing or has no markup configured. This is symmetric
-// with CreateQuote, which also refuses without a settings row — if a caller
-// can't trade, they shouldn't see a rate either.
-func (s *OnRampService) GetIndicativeRates(ctx context.Context, accountID, settlement string) (RatesResponse, error) {
+// account context is missing or has no settings row. This is symmetric with
+// CreateQuote — if a caller can't trade, they shouldn't see a rate either.
+func (s *OnRampService) GetIndicativeRates(ctx context.Context, accountID, settlement string, amountBRL float64) (RatesResponse, error) {
 	if settlement == "" {
 		settlement = "D0"
 	}
-
+	if settlement != "D0" && settlement != "D1" && settlement != "D2" {
+		return RatesResponse{}, fmt.Errorf("invalid settlement %q: must be D0, D1 or D2", settlement)
+	}
 	if accountID == "" {
 		return RatesResponse{}, ErrAccountRequired
 	}
-	markupPct, ok := s.spotMarkupFor(ctx, accountID)
+	if amountBRL <= 0 {
+		amountBRL = IndicativeRatesAmount
+	}
+
+	params, ok := s.pricingFor(ctx, accountID)
 	if !ok {
 		return RatesResponse{}, ErrNoOnRampSettings
 	}
 
-	grid, err := s.transfero.GetPrices(ctx)
+	discovery, err := s.transfero.CreateSessionByBRL(ctx, amountBRL, settlement)
 	if err != nil {
-		return RatesResponse{}, s.wrapTransferoErr(err, "get prices")
+		return RatesResponse{}, s.wrapTransferoErr(err, "discovery session")
 	}
-	if grid.Spot <= 0 {
-		return RatesResponse{}, fmt.Errorf("invalid spot price from upstream: %v", grid.Spot)
-	}
-
-	usdtPrices, ok := grid.Prices["USDT"]
-	if !ok {
-		return RatesResponse{}, fmt.Errorf("USDT prices not available")
+	if discovery.Spot <= 0 || discovery.Price <= 0 {
+		return RatesResponse{}, fmt.Errorf("invalid discovery session: spot=%v price=%v", discovery.Spot, discovery.Price)
 	}
 
-	var entry transfero.PriceEntry
-	switch settlement {
-	case "D0":
-		entry = usdtPrices.D0
-	case "D1":
-		entry = usdtPrices.D1
-	case "D2":
-		entry = usdtPrices.D2
-	default:
-		return RatesResponse{}, fmt.Errorf("invalid settlement %q", settlement)
-	}
+	price, regime := computeCustomerPrice(discovery.Spot, discovery.Price, params)
 
-	displayPrice := grid.Spot * (1 + markupPct/100)
-	condition := s.marketConditionFor(ctx, accountID, grid.Spot, entry.Price)
+	s.log.Info("onramp.rates.indicative",
+		"account", accountID,
+		"settlement", settlement,
+		"amountBRL", amountBRL,
+		"discoverySessionId", discovery.SessionID,
+		"discoverySpot", discovery.Spot,
+		"discoveryD0", discovery.Price,
+		"basisD0OverSpot", discovery.Price/discovery.Spot,
+		"regime", regime,
+		"customerPrice", price,
+		"spot_markup_pct", params.SpotMarkupPct,
+		"d0_markup_pct", params.D0MarkupPct,
+		"basis_threshold_pct", params.BasisThresholdPct,
+	)
 
 	return RatesResponse{
-		FromCurrency:    "BRL",
-		ToCurrency:      "USDT",
-		Price:           displayPrice,
-		Settlement:      settlement,
-		MarketCondition: condition,
-		IndicativeAt:    time.Now().UTC().Format(time.RFC3339),
+		FromCurrency: "BRL",
+		ToCurrency:   "USDT",
+		Price:        price,
+		RawPrice:     discovery.Price,
+		PriceRegime:  regime,
+		Settlement:   settlement,
+		IndicativeAt: time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }
 

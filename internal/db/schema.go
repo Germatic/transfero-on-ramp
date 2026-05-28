@@ -89,25 +89,42 @@ CREATE INDEX IF NOT EXISTS onramp_fees_lookup
   ON onramp_fees (account_id, from_currency, to_currency, effective_from DESC);
 
 -- -------------------------------------------------------
--- Per-account on-ramp settings.
--- max_d0_premium_pct: maximum allowed percentage by which the D0 settlement
---   price may exceed the spot price before the trade is rejected.
---   NULL = no guard (all prices accepted).
---   e.g. 0.036000 = 0.036%.
--- -------------------------------------------------------
--- onramp_account_settings: per-account markup applied over the spot price.
--- spot_markup_pct is both the fee charged to the customer and the guard threshold:
---   adjusted_price = spot × (1 + spot_markup_pct / 100)
---   if D0 > adjusted_price → MARKET_DISLOCATION (trade blocked)
+-- onramp_account_settings — per-account BRL→USDT pricing knobs.
+--
+-- The customer-facing price follows a two-regime rule, anchored on the
+-- (Spot, D0) pair Transfero returns from a live session:
+--
+--   basis = D0 / Spot                      -- how much premium Transfero
+--                                          -- bakes into the settlement leg
+--
+--   if basis ≤ 1 + basis_threshold_pct/100   (low-basis regime)
+--      customer_price = Spot × (1 + spot_markup_pct/100)
+--   else                                      (high-basis regime)
+--      customer_price = D0   × (1 + d0_markup_pct/100)
+--
+-- Defaults match the operator spec landed 2026-05-28:
+--   spot_markup_pct      = 0.36   → 36 bps over Spot in the low-basis regime
+--   d0_markup_pct        = 0.20   → 20 bps over D0   in the high-basis regime
+--   basis_threshold_pct  = 0.25   → regime flips at D0/Spot = 1.0025
+--
+-- The high-basis branch replaces the old MARKET_DISLOCATION 422 reject:
+-- every quote now executes; the operator's margin in the high-basis regime
+-- is guaranteed at d0_markup_pct of D0 instead of zero / blocked.
+--
 -- Every account that uses the on-ramp MUST have a row here.
--- i.e. 0.36 means zero point 36 percent (0.36 %)
+-- i.e. 0.36 means zero point 36 percent (0.36 %).
+-- -------------------------------------------------------
 CREATE TABLE IF NOT EXISTS onramp_account_settings (
-  account_id      TEXT        PRIMARY KEY,
-  spot_markup_pct NUMERIC(10,6) NOT NULL,  -- e.g. 0.360000 = 0.36 %
-  description     TEXT,
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+  account_id          TEXT          PRIMARY KEY,
+  spot_markup_pct     NUMERIC(10,6) NOT NULL,                   -- e.g. 0.360000 = 0.36 %
+  d0_markup_pct       NUMERIC(10,6) NOT NULL DEFAULT 0.200000,  -- high-basis markup
+  basis_threshold_pct NUMERIC(10,6) NOT NULL DEFAULT 0.250000,  -- regime cutover at D0/Spot
+  description         TEXT,
+  updated_at          TIMESTAMPTZ   NOT NULL DEFAULT now()
 );
-ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS description     TEXT;
-ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS spot_markup_pct NUMERIC(10,6);
+ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS description         TEXT;
+ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS spot_markup_pct     NUMERIC(10,6);
+ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS d0_markup_pct       NUMERIC(10,6) NOT NULL DEFAULT 0.200000;
+ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS basis_threshold_pct NUMERIC(10,6) NOT NULL DEFAULT 0.250000;
 ALTER TABLE onramp_account_settings DROP COLUMN IF EXISTS   max_d0_premium_pct;
 `

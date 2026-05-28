@@ -195,13 +195,28 @@ func handleListOrders(svc *service.OnRampService, log *slog.Logger) http.Handler
 // Rates handler
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GET /v1/rates?settlement=D0
-// Returns an indicative BRL→USDT price. No quote is locked.
+// GET /v1/rates?settlement=D0&amount=100
+// Returns an indicative BRL→USDT price derived from a live Transfero discovery
+// session and the two-regime pricing rule. No quote is locked.
+//
+// The optional amount query param sizes the discovery session (default
+// service.IndicativeRatesAmount). The discovery session is never closed;
+// Transfero expires it server-side after ~7s.
 func handleGetRates(svc *service.OnRampService, log *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		settlement := r.URL.Query().Get("settlement")
 		if settlement == "" {
 			settlement = "D0"
+		}
+
+		var amountBRL float64
+		if raw := r.URL.Query().Get("amount"); raw != "" {
+			parsed, parseErr := strconv.ParseFloat(raw, 64)
+			if parseErr != nil || parsed <= 0 {
+				writeError(w, http.StatusBadRequest, "invalid amount")
+				return
+			}
+			amountBRL = parsed
 		}
 
 		account, _ := auth.FromContext(r.Context())
@@ -211,7 +226,7 @@ func handleGetRates(svc *service.OnRampService, log *slog.Logger) http.HandlerFu
 		if accountID == "" {
 			accountID = account.ID
 		}
-		resp, err := svc.GetIndicativeRates(r.Context(), accountID, settlement)
+		resp, err := svc.GetIndicativeRates(r.Context(), accountID, settlement, amountBRL)
 		if err != nil {
 			log.Warn("get rates failed", "err", err)
 			if writeProviderErr(w, err) {

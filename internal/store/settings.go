@@ -12,10 +12,21 @@ import (
 var ErrNoAccountSettings = errors.New("no onramp settings configured for account")
 
 // AccountSettings holds per-account on-ramp configuration.
+//
+// The customer-facing BRL→USDT price follows a two-regime rule anchored on
+// the (Spot, D0) pair Transfero returns from a live session:
+//
+//	basis = D0 / Spot
+//	if basis ≤ 1 + BasisThresholdPct/100   → customer = Spot × (1 + SpotMarkupPct/100)
+//	else                                   → customer = D0   × (1 + D0MarkupPct/100)
+//
+// Defaults (operator spec 2026-05-28): 0.36 / 0.20 / 0.25.
 type AccountSettings struct {
-	AccountID     string
-	SpotMarkupPct float64 // e.g. 0.36 = 0.36 %
-	Description   string
+	AccountID         string
+	SpotMarkupPct     float64 // low-basis regime markup over Spot, e.g. 0.36
+	D0MarkupPct       float64 // high-basis regime markup over D0,   e.g. 0.20
+	BasisThresholdPct float64 // regime cutover at D0/Spot,           e.g. 0.25 (= 1.0025)
+	Description       string
 }
 
 // SettingsStore handles persistence for onramp_account_settings.
@@ -32,12 +43,22 @@ func NewSettingsStore(pool *pgxpool.Pool) *SettingsStore {
 // Returns ErrNoAccountSettings when no row exists.
 func (s *SettingsStore) GetSettings(ctx context.Context, accountID string) (AccountSettings, error) {
 	const sql = `
-		SELECT account_id, spot_markup_pct, COALESCE(description, '')
+		SELECT account_id,
+		       spot_markup_pct,
+		       d0_markup_pct,
+		       basis_threshold_pct,
+		       COALESCE(description, '')
 		FROM onramp_account_settings
 		WHERE account_id = $1`
 
 	var as AccountSettings
-	err := s.pool.QueryRow(ctx, sql, accountID).Scan(&as.AccountID, &as.SpotMarkupPct, &as.Description)
+	err := s.pool.QueryRow(ctx, sql, accountID).Scan(
+		&as.AccountID,
+		&as.SpotMarkupPct,
+		&as.D0MarkupPct,
+		&as.BasisThresholdPct,
+		&as.Description,
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return AccountSettings{}, ErrNoAccountSettings
@@ -50,12 +71,16 @@ func (s *SettingsStore) GetSettings(ctx context.Context, accountID string) (Acco
 // SetSettings upserts the settings for an account.
 func (s *SettingsStore) SetSettings(ctx context.Context, as AccountSettings) error {
 	const sql = `
-		INSERT INTO onramp_account_settings (account_id, spot_markup_pct, description, updated_at)
-		VALUES ($1, $2, $3, now())
+		INSERT INTO onramp_account_settings (
+		    account_id, spot_markup_pct, d0_markup_pct, basis_threshold_pct, description, updated_at
+		)
+		VALUES ($1, $2, $3, $4, $5, now())
 		ON CONFLICT (account_id) DO UPDATE
-		  SET spot_markup_pct = EXCLUDED.spot_markup_pct,
-		      description     = EXCLUDED.description,
-		      updated_at      = now()`
-	_, err := s.pool.Exec(ctx, sql, as.AccountID, as.SpotMarkupPct, as.Description)
+		  SET spot_markup_pct     = EXCLUDED.spot_markup_pct,
+		      d0_markup_pct       = EXCLUDED.d0_markup_pct,
+		      basis_threshold_pct = EXCLUDED.basis_threshold_pct,
+		      description         = EXCLUDED.description,
+		      updated_at          = now()`
+	_, err := s.pool.Exec(ctx, sql, as.AccountID, as.SpotMarkupPct, as.D0MarkupPct, as.BasisThresholdPct, as.Description)
 	return err
 }
