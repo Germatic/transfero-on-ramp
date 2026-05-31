@@ -127,4 +127,19 @@ ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS spot_markup_pct    
 ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS d0_markup_pct       NUMERIC(10,6) NOT NULL DEFAULT 0.200000;
 ALTER TABLE onramp_account_settings ADD COLUMN IF NOT EXISTS basis_threshold_pct NUMERIC(10,6) NOT NULL DEFAULT 0.250000;
 ALTER TABLE onramp_account_settings DROP COLUMN IF EXISTS   max_d0_premium_pct;
+
+-- Sanity bounds: a fat-finger UPDATE can't silently make us 1000-bps cheap or
+-- expensive. Drop-then-add keeps EnsureSchema idempotent across boots.
+ALTER TABLE onramp_account_settings
+  DROP CONSTRAINT IF EXISTS onramp_account_settings_spot_markup_chk,
+  ADD  CONSTRAINT          onramp_account_settings_spot_markup_chk
+       CHECK (spot_markup_pct >= 0 AND spot_markup_pct <= 10);
+ALTER TABLE onramp_account_settings
+  DROP CONSTRAINT IF EXISTS onramp_account_settings_d0_markup_chk,
+  ADD  CONSTRAINT          onramp_account_settings_d0_markup_chk
+       CHECK (d0_markup_pct >= 0 AND d0_markup_pct <= 10);
+ALTER TABLE onramp_account_settings
+  DROP CONSTRAINT IF EXISTS onramp_account_settings_basis_threshold_chk,
+  ADD  CONSTRAINT          onramp_account_settings_basis_threshold_chk
+       CHECK (basis_threshold_pct >= 0 AND basis_threshold_pct <= 100);
 `
