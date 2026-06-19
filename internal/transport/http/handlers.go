@@ -252,6 +252,7 @@ func handleInternalExecute(svc *service.OnRampService, log *slog.Logger) http.Ha
 	type request struct {
 		PayoutID   string  `json:"payoutId"`
 		AccountID  string  `json:"accountId"`
+		MerchantID string  `json:"merchantId,omitempty"`
 		BRLAmount  float64 `json:"brlAmount"`
 		Address    string  `json:"destinationAddress"`
 		Network    string  `json:"network"`
@@ -279,6 +280,7 @@ func handleInternalExecute(svc *service.OnRampService, log *slog.Logger) http.Ha
 		resp, err := svc.ExecuteSettlement(r.Context(), service.ExecuteRequest{
 			PayoutID:   req.PayoutID,
 			AccountID:  req.AccountID,
+			MerchantID: req.MerchantID,
 			BRLAmount:  req.BRLAmount,
 			Address:    req.Address,
 			Network:    req.Network,

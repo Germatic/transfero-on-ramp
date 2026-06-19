@@ -64,6 +64,7 @@ func (e *ProviderError) Error() string {
 // QuoteRequest is the validated input for CreateQuote.
 type QuoteRequest struct {
 	AccountID  string  // resolved from Bearer token, not supplied by caller
+	MerchantID string  // dinacore balance owner; defaults to AccountID
 	BRLAmount  float64 // e.g. 25000.00
 	Settlement string  // D0 | D1 | D2 (default D0)
 	Network    string  // mainnet | shasta (default mainnet)
@@ -86,6 +87,7 @@ type QuoteResponse struct {
 // OrderRequest is the validated input for ConfirmOrder.
 type OrderRequest struct {
 	AccountID          string // resolved from Bearer token
+	MerchantID         string // dinacore balance owner; defaults to AccountID
 	QuoteID            string
 	DestinationAddress string // TRC20 wallet where Transfero delivers USDT
 	PayoutID           string // dinapay payout row ID — stored so reconciler can mark it completed
@@ -221,8 +223,9 @@ func (s *OnRampService) CreateQuote(ctx context.Context, req QuoteRequest) (Quot
 		return QuoteResponse{}, fmt.Errorf("no onramp fee settings configured for account %q", req.AccountID)
 	}
 
-	if s.dinacore != nil && req.AccountID != "" {
-		balance, err := s.dinacore.GetBalance(ctx, req.AccountID, "BRL")
+	if s.dinacore != nil && balanceOwner(req.AccountID, req.MerchantID) != "" {
+		owner := balanceOwner(req.AccountID, req.MerchantID)
+		balance, err := s.dinacore.GetBalance(ctx, owner, "BRL")
 		if err != nil {
 			s.log.Warn("dinacore balance check failed (proceeding)", "account", req.AccountID, "err", err)
 		} else if balance < req.BRLAmount {
@@ -353,8 +356,9 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 	if req.RequestedBRL > 0 {
 		dinaDebitAmt = req.RequestedBRL
 	}
-	if s.dinacore != nil && req.AccountID != "" {
-		if err := s.dinacore.DebitBalance(ctx, req.AccountID, "BRL", dinaDebitAmt, req.QuoteID); err != nil {
+	if s.dinacore != nil && balanceOwner(req.AccountID, req.MerchantID) != "" {
+		owner := balanceOwner(req.AccountID, req.MerchantID)
+		if err := s.dinacore.DebitBalance(ctx, owner, "BRL", dinaDebitAmt, req.QuoteID); err != nil {
 			return OrderResponse{}, fmt.Errorf("debit BRL: %w", err)
 		}
 	}
@@ -372,10 +376,11 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 		if verifyErr != nil || confirmed == nil {
 			// Trade did NOT happen — refund the same amount that was debited.
 			s.log.Info("trade not found on Transfero; refunding BRL", "quoteId", req.QuoteID)
-			if s.dinacore != nil && req.AccountID != "" {
-				if rfErr := s.dinacore.RefundBRL(ctx, req.AccountID, dinaDebitAmt, req.QuoteID); rfErr != nil {
+			if s.dinacore != nil && balanceOwner(req.AccountID, req.MerchantID) != "" {
+				owner := balanceOwner(req.AccountID, req.MerchantID)
+				if rfErr := s.dinacore.RefundBRL(ctx, owner, dinaDebitAmt, req.QuoteID); rfErr != nil {
 					s.log.Error("BRL refund failed — MANUAL INTERVENTION REQUIRED",
-						"quoteId", req.QuoteID, "account", req.AccountID,
+						"quoteId", req.QuoteID, "owner", owner,
 						"brlAmount", dinaDebitAmt, "err", rfErr)
 				}
 			}
@@ -442,11 +447,12 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 	//    When the in-swap flow is implemented (customer holds a USDT balance inside
 	//    Dinaria rather than receiving it on-chain immediately), DestinationAddress
 	//    will be empty and this block will run correctly.
-	if s.dinacore != nil && req.AccountID != "" && req.DestinationAddress == "" {
-		if err := s.dinacore.CreditBalance(ctx, req.AccountID, "USDT", closing.Amount, closing.ClosingID); err != nil {
+	if s.dinacore != nil && balanceOwner(req.AccountID, req.MerchantID) != "" && req.DestinationAddress == "" {
+		owner := balanceOwner(req.AccountID, req.MerchantID)
+		if err := s.dinacore.CreditBalance(ctx, owner, "USDT", closing.Amount, closing.ClosingID); err != nil {
 			s.log.Error("dinacore USDT credit failed — MANUAL INTERVENTION REQUIRED",
 				"quoteId", req.QuoteID, "closingId", closing.ClosingID,
-				"account", req.AccountID, "usdtAmount", closing.Amount, "err", err)
+				"owner", owner, "usdtAmount", closing.Amount, "err", err)
 		}
 	}
 
@@ -497,6 +503,13 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 	return resp, nil
 }
 
+func balanceOwner(accountID, merchantID string) string {
+	if merchantID != "" {
+		return merchantID
+	}
+	return accountID
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal execution (called by dinapay OnRampExecutor)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -505,6 +518,7 @@ func (s *OnRampService) ConfirmOrder(ctx context.Context, req OrderRequest) (Ord
 type ExecuteRequest struct {
 	PayoutID   string // dinapay payout ID (for logging / idempotency tracking)
 	AccountID  string
+	MerchantID string
 	BRLAmount  float64
 	Address    string
 	Network    string
@@ -541,6 +555,7 @@ func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteReques
 
 	quote, err := s.CreateQuote(ctx, QuoteRequest{
 		AccountID:  req.AccountID,
+		MerchantID: req.MerchantID,
 		BRLAmount:  req.BRLAmount,
 		Settlement: req.Settlement,
 		Network:    req.Network,
@@ -551,10 +566,11 @@ func (s *OnRampService) ExecuteSettlement(ctx context.Context, req ExecuteReques
 
 	order, err := s.ConfirmOrder(ctx, OrderRequest{
 		AccountID:          req.AccountID,
+		MerchantID:         req.MerchantID,
 		QuoteID:            quote.QuoteID,
 		DestinationAddress: req.Address,
-		PayoutID:           req.PayoutID,  // stored in onramp_orders so reconciler can complete the payout
-		RequestedBRL:       req.BRLAmount, // full merchant amount; keeps Dinacore in sync with Dinapay
+		PayoutID:           req.PayoutID,
+		RequestedBRL:       req.BRLAmount,
 	})
 	if err != nil {
 		return ExecuteResponse{}, fmt.Errorf("confirm order: %w", err)
