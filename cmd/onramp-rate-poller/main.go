@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -138,9 +139,13 @@ func pollOnce(ctx context.Context, log *slog.Logger, svc *service.OnRampService,
 		log.Info("onramp.rate_poll",
 			"brtTime", brtNow(),
 			"account", accountID,
-			"customerPrice", rates.Price,
+			"customerPrice", round4(rates.Price),
 		)
 	}
+}
+
+func round4(v float64) float64 {
+	return math.Round(v*10000) / 10000
 }
 
 func resolveAccountList() []string {
